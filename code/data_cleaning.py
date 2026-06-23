@@ -15,23 +15,21 @@
 
 输出：
     清洗后的数据文件（统一命名、统一列名），供后续 OD 提取、缓存构建直接读取。
+    出行信息表（OD表），在原需求11基础上补充了距离/时长/速度/方向等派生字段，
+    方便后续地图展示、统计分析、ETA预测直接复用，不用每个模块重复计算一遍。
 
-使用方式：
-    1. 修改下方“配置区”的路径（不要写死个人电脑的绝对路径，建议放到项目根目录下的相对路径）
-    2. 直接运行：python data_cleaning.py
-    3. 如果数据量过大（千万级），把 USE_CHUNK 设为 True，按 CHUNK_SIZE 分块读取
 """
 
 import os
 import logging
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-# ========================= 配置区（唯一需要手动改的地方） =========================
-RAW_DATA_PATH = "../data/raw/TaxiData.csv"          # 原始数据路径（相对项目根目录）
+# ========================= 配置区 =========================
+RAW_DATA_PATH = "../data/raw/TaxiData.csv"            # 原始数据路径（相对项目根目录）
 CLEAN_DATA_PATH = "../data/processed/taxi_clean.csv"  # 清洗后数据输出路径
-OD_DATA_PATH = "../data/processed/taxi_od.csv"        # OD（上下车点）提取结果输出路径
-LOG_PATH = "../docs/cleaning_log.txt"            # 清洗日志输出路径
+OD_DATA_PATH = "../data/processed/taxi_od.csv"        # 出行信息表（OD）输出路径
+LOG_PATH = "../docs/cleaning_log.txt"                 # 清洗日志输出路径
 
 COLUMNS = ['id', 'time', 'long', 'lati', 'status', 'speed']  # 统一列名，全项目必须保持一致
 DATE_PREFIX = "2013-10-22"   # 原始time只有时分秒，需要拼接的日期；按实际数据日期修改
@@ -39,6 +37,11 @@ ABNORMAL_SECONDS_THRESHOLD = 60  # 异常状态切换的时间阈值（需求8-1
 
 USE_CHUNK = False             # 数据量是千万级时改为 True
 CHUNK_SIZE = 5_000_000        # 分块大小，按机器内存调整
+
+# OD表派生字段的合理性过滤阈值，超出范围的订单大概率是脏数据/GPS漂移导致的异常订单
+OD_MAX_DISTANCE_KM = 100      # 单次出行最大合理距离(km)
+OD_MAX_DURATION_HOUR = 3      # 单次出行最大合理时长(小时)
+OD_MIN_DURATION_SEC = 30       # 单次出行最小合理时长(秒)，太短大概率是误触发
 # ===============================================================================
 
 logging.basicConfig(
@@ -234,13 +237,45 @@ def remove_abnormal_status(df: pd.DataFrame, seconds_threshold: int = ABNORMAL_S
     return df
 
 
-# --------------------------- 6. OD（上下车点）初步提取（需求11，02阶段任务） ---------------------------
+# --------------------------- 6. 距离/方向计算工具函数 ---------------------------
+def haversine_distance(lng1, lat1, lng2, lat2) -> np.ndarray:
+    """
+    Haversine公式计算两点间球面距离（单位：km），向量化实现，可直接传入Series。
+    比直接用平面欧式距离更准确，经纬度跨度大一点就会有明显误差。
+    """
+    R = 6371.0  # 地球半径(km)
+    lng1, lat1, lng2, lat2 = map(np.radians, [lng1, lat1, lng2, lat2])
+    dlng = lng2 - lng1
+    dlat = lat2 - lat1
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlng / 2) ** 2
+    c = 2 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+    return R * c
+
+
+def bearing_angle(lng1, lat1, lng2, lat2) -> np.ndarray:
+    """
+    计算从起点到终点的方向角(0-360度，正北为0，顺时针)，即项目里常说的 HEAD 字段。
+    后续地图匹配、HMM、轨迹动画都会用到方向信息，这里提前算好存进OD表。
+    """
+    lng1, lat1, lng2, lat2 = map(np.radians, [lng1, lat1, lng2, lat2])
+    dlng = lng2 - lng1
+    y = np.sin(dlng) * np.cos(lat2)
+    x = np.cos(lat1) * np.sin(lat2) - np.sin(lat1) * np.cos(lat2) * np.cos(dlng)
+    brng = np.degrees(np.arctan2(y, x))
+    return (brng + 360) % 360
+
+
+# --------------------------- 7. OD（出行信息表）提取（需求11，02阶段任务） ---------------------------
 def extract_od(df: pd.DataFrame) -> pd.DataFrame:
     """
-    需求11：把GPS明细表转换为出行（OD）信息表。
-    逻辑：
-        status_chg = status - status_up，1表示上车，-1表示下车
-        筛选出同一车辆下，"上车行"与紧随其后的"下车行"，错位拼接为一行订单记录
+    需求11：把GPS明细表转换为出行（OD）信息表，并补充派生字段方便后续直接复用：
+        - 轨迹距离(km)：起终点直线距离（Haversine），区别于实际行驶路程，
+          仅作为快速筛选异常订单和粗略统计用，精确路网距离要在路网校正/HMM阶段重新计算
+        - 订单时长(秒/分钟)
+        - 平均速度(km/h) = 距离/时长，用于辅助判断订单是否异常（速度过高大概率是异常订单）
+        - 方向角HEAD(度)：起点到终点的方位角，后续轨迹动画、HMM匹配会用到
+        - 开始/结束所在小时、日期：方便04/05阶段直接 groupby 按小时统计，不用重复转换
+        - is_valid：按距离/时长阈值标记的订单合理性，方便后续模块按需筛选，而不是直接物理删除数据
     """
     df = df.sort_values(by=['id', 'time']).reset_index(drop=True)
     df['status_up'] = df['status'].shift(1)
@@ -262,11 +297,48 @@ def extract_od(df: pd.DataFrame) -> pd.DataFrame:
     ].copy()
 
     df_order.columns = ['车辆id', '开始时间', '开始经度', '开始纬度', '结束时间', '结束经度', '结束纬度']
-    log.info(f"OD初步提取完成，订单数：{df_order.shape[0]}")
-    return df_order.reset_index(drop=True)
+    df_order = df_order.reset_index(drop=True)
+
+    # ---- 派生字段：距离 / 时长 / 速度 / 方向 ----
+    df_order['轨迹距离_km'] = haversine_distance(
+        df_order['开始经度'], df_order['开始纬度'],
+        df_order['结束经度'], df_order['结束纬度']
+    ).round(3)
+
+    df_order['订单时长_秒'] = (df_order['结束时间'] - df_order['开始时间']).dt.total_seconds()
+    df_order['订单时长_分钟'] = (df_order['订单时长_秒'] / 60).round(2)
+
+    # 平均速度：时长为0时设为0，避免除零产生inf
+    df_order['平均速度_kmh'] = np.where(
+        df_order['订单时长_秒'] > 0,
+        df_order['轨迹距离_km'] / (df_order['订单时长_秒'] / 3600),
+        0
+    ).round(2)
+
+    df_order['方向角_HEAD'] = bearing_angle(
+        df_order['开始经度'], df_order['开始纬度'],
+        df_order['结束经度'], df_order['结束纬度']
+    ).round(1)
+
+    # ---- 派生字段：方便后续按时间维度统计，不用每个模块重复写dt.hour ----
+    df_order['开始日期'] = df_order['开始时间'].dt.date
+    df_order['开始小时'] = df_order['开始时间'].dt.hour
+
+    # ---- 合理性标记：不直接删除，只打标记，后续模块自己决定是否过滤 ----
+    df_order['is_valid'] = (
+        (df_order['轨迹距离_km'] <= OD_MAX_DISTANCE_KM) &
+        (df_order['订单时长_秒'] >= OD_MIN_DURATION_SEC) &
+        (df_order['订单时长_秒'] <= OD_MAX_DURATION_HOUR * 3600) &
+        (df_order['平均速度_kmh'] <= 120)
+    )
+
+    n_invalid = (~df_order['is_valid']).sum()
+    log.info(f"OD提取完成，订单数：{df_order.shape[0]}（其中按距离/时长/速度阈值标记为异常：{n_invalid}）")
+
+    return df_order
 
 
-# --------------------------- 7. 主流程 ---------------------------
+# --------------------------- 8. 主流程 ---------------------------
 def main():
     log.info("========== 数据清洗流程开始 ==========")
 
@@ -288,15 +360,21 @@ def main():
     df.to_csv(CLEAN_DATA_PATH, index=False, encoding="utf-8-sig")
     log.info(f"清洗后数据已保存至 {CLEAN_DATA_PATH}，最终shape={df.shape}")
 
-    df_order = extract_od(df)                 # 需求11：OD初步提取
+    df_order = extract_od(df)                 # 需求11：出行信息表(OD)提取 + 派生字段
+    os.makedirs(os.path.dirname(OD_DATA_PATH), exist_ok=True)
     df_order.to_csv(OD_DATA_PATH, index=False, encoding="utf-8-sig")
-    log.info(f"OD数据已保存至 {OD_DATA_PATH}，订单数={df_order.shape[0]}")
+    log.info(f"出行信息表(OD)已保存至 {OD_DATA_PATH}，订单数={df_order.shape[0]}")
 
     log.info("========== 检查点汇总 ==========")
     log.info(f"重复值清洗：{n_before_dup} -> {n_after_dup}（剔除 {n_before_dup - n_after_dup}）")
     log.info(f"异常值清洗：{n_before_abn} -> {n_after_abn}（剔除 {n_before_abn - n_after_abn}）")
     log.info(f"字段类型：\n{df.dtypes}")
-    log.info(f"上车点数量：{(df_order['车辆id'].notna()).sum()}，下车点已配对（即订单数）：{df_order.shape[0]}")
+    log.info(
+        f"出行信息表订单数：{df_order.shape[0]}，"
+        f"平均距离：{df_order['轨迹距离_km'].mean():.2f}km，"
+        f"平均时长：{df_order['订单时长_分钟'].mean():.2f}分钟，"
+        f"按阈值标记为异常订单数：{(~df_order['is_valid']).sum()}"
+    )
     log.info("========== 数据清洗流程结束 ==========")
 
 
