@@ -20,7 +20,7 @@ import seaborn as sns
 OD_DATA_PATH = "../data/processed/taxi_od.csv"
 FIG_DIR = "../docs/figures"   # 图表输出目录
 
-# 解决中文显示问题，按你系统实际安装的字体改（Windows用"SimHei"，Mac用"PingFang SC"等）
+# 解决中文显示问题
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS', 'PingFang SC']
 plt.rcParams['axes.unicode_minus'] = False
 # ===========================================================

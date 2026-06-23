@@ -152,6 +152,9 @@ def _dup_check(group: pd.DataFrame):
     少数服从多数：status多数为0就保留一个0；多数为1就保留一个1。
     """
     cnt, s = group['stat_cnt'].max(), group['stat_sum'].max()
+    """
+    s为载客的总条数，s=0全是空载，s=cnt全是载客
+    """
     if s == 0:
         return group['index'].values[0]
     if s == cnt:

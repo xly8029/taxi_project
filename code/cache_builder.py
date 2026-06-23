@@ -72,8 +72,8 @@ def split_valid_invalid_orders(df_order: pd.DataFrame) -> tuple[pd.DataFrame, pd
     if '订单时长_秒' not in df_order.columns:
         df_order['订单时长_秒'] = (df_order['结束时间'] - df_order['开始时间']).dt.total_seconds()
 
-    cond_missing = df_order['开始时间'].isna() | df_order['结束时间'].isna()
-    cond_negative_time = df_order['订单时长_秒'] < 0
+    cond_missing = df_order['开始时间'].isna() | df_order['结束时间'].isna()        #开始 / 结束时间为空
+    cond_negative_time = df_order['订单时长_秒'] < 0     #订单时长为负
     cond_too_short = df_order['订单时长_秒'] < OD_MIN_DURATION_SEC
     cond_too_long = df_order['订单时长_秒'] > OD_MAX_DURATION_HOUR * 3600
 
@@ -163,7 +163,7 @@ def build_minute_cache(
         # 标记真实GPS点所在的分钟，resample之前先打标记，避免被ffill污染
         df_v['is_observed'] = True
 
-        df_r = df_v.resample(freq).last()
+        df_r = df_v.resample(freq).last()       # 取该分钟最后一条真实GPS记录
         df_r['is_observed'] = df_r['is_observed'].fillna(False)
         df_r = df_r.ffill()
         df_r['is_observed'] = df_r['is_observed'].astype(bool)
