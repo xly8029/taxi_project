@@ -26,15 +26,15 @@ import numpy as np
 import pandas as pd
 
 # ========================= 配置区 =========================
-CLEAN_DATA_PATH = "../data/processed/taxi_clean.csv"
-OD_DATA_PATH = "../data/processed/taxi_od.csv"
-OD_INVALID_PATH = "../data/processed/taxi_od_invalid.csv"
+CLEAN_DATA_PATH = os.path.join(os.path.dirname(__file__), "../data/processed/taxi_clean.csv")
+OD_DATA_PATH = os.path.join(os.path.dirname(__file__), "../data/processed/taxi_od.csv")
+OD_INVALID_PATH = os.path.join(os.path.dirname(__file__), "../data/processed/taxi_od_invalid.csv")
 
-VEHICLE_CACHE_DIR = "../data/cache/vehicle"
-MINUTE_CACHE_DIR = "../data/cache/minute"
-OD_CACHE_PATH = "../data/cache/od/od_cache.csv"
+VEHICLE_CACHE_DIR = os.path.join(os.path.dirname(__file__), "../data/cache/vehicle")
+MINUTE_CACHE_DIR = os.path.join(os.path.dirname(__file__), "../data/cache/minute")
+OD_CACHE_PATH = os.path.join(os.path.dirname(__file__), "../data/cache/od/od_cache.csv")
 
-LOG_PATH = "../docs/cache_log.txt"
+LOG_PATH = os.path.join(os.path.dirname(__file__), "../docs/cache_log.txt")
 
 # OD异常订单判断阈值（和data_cleaning.py里is_valid的阈值保持一致，避免两边标准不统一）
 OD_MAX_DISTANCE_KM = 100

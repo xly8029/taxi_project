@@ -26,10 +26,10 @@ import numpy as np
 import pandas as pd
 
 # ========================= 配置区 =========================
-RAW_DATA_PATH = "../data/raw/TaxiData.csv"            # 原始数据路径（相对项目根目录）
-CLEAN_DATA_PATH = "../data/processed/taxi_clean.csv"  # 清洗后数据输出路径
-OD_DATA_PATH = "../data/processed/taxi_od.csv"        # 出行信息表（OD）输出路径
-LOG_PATH = "../docs/cleaning_log.txt"                 # 清洗日志输出路径
+RAW_DATA_PATH = os.path.join(os.path.dirname(__file__), "../data/raw/TaxiData.csv")  # 原始数据路径
+CLEAN_DATA_PATH = os.path.join(os.path.dirname(__file__), "../data/processed/taxi_clean.csv")  # 清洗后数据输出路径
+OD_DATA_PATH = os.path.join(os.path.dirname(__file__), "../data/processed/taxi_od.csv")  # 出行信息表（OD）输出路径
+LOG_PATH = os.path.join(os.path.dirname(__file__), "../docs/cleaning_log.txt")  # 清洗日志输出路径
 
 COLUMNS = ['id', 'time', 'long', 'lati', 'status', 'speed']  # 统一列名，全项目必须保持一致
 DATE_PREFIX = "2013-10-22"   # 原始time只有时分秒，需要拼接的日期；按实际数据日期修改
