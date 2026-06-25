@@ -78,17 +78,24 @@ def create_base_map(title: str):
     return m
 
 
-def scale_heat_weight(series: pd.Series, floor: float = 0.05) -> pd.Series:
-    """把热力权重压缩到可见区间，避免弱点完全看不见。"""
+def scale_heat_weight(series: pd.Series, lower_percentile: float = 20) -> pd.Series:
+    """基于百分位数裁剪的热力权重缩放，避免低密度区域被固定阈值不合理抬高。"""
     max_weight = series.max()
     if max_weight <= 0:
-        return pd.Series([floor] * len(series), index=series.index)
+        return pd.Series([0.05] * len(series), index=series.index)
 
-    normalized = series / max_weight
+    import numpy as np
 
-    # 使用平方增强高密度区域差异
+    low_val = np.percentile(series, lower_percentile)
+    clipped = series.clip(low_val, max_weight)
+
+    if max_weight > low_val:
+        normalized = (clipped - low_val) / (max_weight - low_val)
+    else:
+        return pd.Series([0.5] * len(series), index=series.index)
+
     normalized = normalized ** 2
-    return floor + (1 - floor) * normalized
+    return 0.05 + 0.95 * normalized
 
 
 def build_weighted_heat_points(df: pd.DataFrame, lat_col: str, lon_col: str, precision: int = 4):
