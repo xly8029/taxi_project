@@ -364,7 +364,180 @@ def load_minute_snapshot(time_str):
     return df
 
 
-def plot_minute_snapshot(time_str, vehicle_ids=None, max_vehicles=100):
+def _build_trajectory_lookup_js(map_js_name):
+    """
+    生成"点击车辆标记 -> 弹窗确认 -> 当前页面逐点动画播放该车后续轨迹"的JS脚本。
+
+    流程：
+        1. 标记的popup里有一个"查看后续轨迹"按钮，点击后调用 window.queryVehicleTrajectoryAfter
+        2. 该函数先弹出确认框（confirm），确认后调用后端 /api/vehicle_trajectory 接口
+           （这个接口在 map_web_app.py 里已经实现，专门返回"指定车辆从某时间点开始的后续轨迹"）
+        3. 拿到轨迹点数据后，不是一次性画出整条线，而是像单车动画轨迹那样"一点一点播放出来"：
+           - 一个车辆图标marker沿轨迹移动
+           - 轨迹线按载客/空载状态分段：载客段白色描边、空载段黑色描边，内部主线统一红色
+           - 右上角有一个"动画速度倍数"输入框（跟单车动画轨迹页面的输入框一样，可以自己输入
+             任意数字，默认200），动画播放过程中随时可以改，下一帧就会用上新速度，不用重新查询
+        4. 每次点新的车辆前，会先清掉上一次的动画轨迹和计时器，避免画面里叠了一堆线、
+           或者上一次动画还在后台偷偷继续跑
+    """
+    return f"""
+    <div id="traj-speed-panel" style="display:none; position:fixed; top:70px; right:10px; z-index:9999;
+                background:white; padding:10px 12px; border-radius:8px;
+                box-shadow:0 2px 8px rgba(0,0,0,0.3); font-size:13px; font-family:sans-serif;">
+      <div style="margin-bottom:6px; color:#333;">动画速度倍数</div>
+      <input id="traj-speed-input" type="number" min="1" step="1" value="200" placeholder="200"
+             style="width:90px;padding:5px 8px;border:1px solid #ccc;border-radius:6px;font-size:13px;">
+    </div>
+    <script>
+    (function() {{
+        var mapRef = null;
+        var lookupLayers = [];
+        var lookupMarker = null;
+        var lookupTimer = null;
+        var lookupIndex = 0;
+        var lookupCurrentStatus = null;
+        var lookupCurrentCoords = [];
+        var lookupOuterLine = null;
+        var lookupInnerLine = null;
+
+        window.trajectoryAnimSpeed = 200;  // 默认倍速，和单车动画轨迹的默认值保持一致
+
+        function waitForMap(callback) {{
+            if (typeof {map_js_name} !== 'undefined' && {map_js_name}) {{
+                mapRef = {map_js_name};
+                callback();
+            }} else {{
+                setTimeout(function() {{ waitForMap(callback); }}, 100);
+            }}
+        }}
+
+        // 速度输入框：可以直接输入任意数字，跟单车动画轨迹的"动画速度倍数"输入框一样，
+        // 不再限制成几个固定档位。边输入边生效，下一帧动画就会用上新数值，不用重新点查询。
+        document.addEventListener('input', function(e) {{
+            if (e.target && e.target.id === 'traj-speed-input') {{
+                var v = parseFloat(e.target.value);
+                if (!isNaN(v) && v > 0) {{
+                    window.trajectoryAnimSpeed = v;
+                }}
+            }}
+        }});
+
+        function clearLookupLayers() {{
+            lookupLayers.forEach(function(layer) {{ mapRef.removeLayer(layer); }});
+            lookupLayers = [];
+            if (lookupMarker) {{ mapRef.removeLayer(lookupMarker); lookupMarker = null; }}
+            if (lookupTimer) {{ clearTimeout(lookupTimer); lookupTimer = null; }}
+            lookupIndex = 0;
+            lookupCurrentStatus = null;
+            lookupCurrentCoords = [];
+        }}
+
+        function startLookupSegment(status, coord) {{
+            lookupCurrentStatus = status;
+            lookupCurrentCoords = [coord];
+            var outlineColor = status === 1 ? '#ffffff' : '#000000';
+            lookupOuterLine = L.polyline([], {{color: outlineColor, weight: 7, opacity: 0.9}}).addTo(mapRef);
+            lookupInnerLine = L.polyline([], {{color: '#d90429', weight: 4, opacity: 0.95}}).addTo(mapRef);
+            lookupLayers.push(lookupOuterLine, lookupInnerLine);
+            updateLookupSegment();
+        }}
+
+        function updateLookupSegment() {{
+            lookupOuterLine.setLatLngs(lookupCurrentCoords);
+            lookupInnerLine.setLatLngs(lookupCurrentCoords);
+        }}
+
+        function animateLookupStep(points, vehicleId) {{
+            if (lookupIndex >= points.length) {{
+                var last = points[points.length - 1];
+                var endMarker = L.circleMarker([last.lat, last.lng], {{
+                    radius: 6, color: '#fb5607', fillColor: '#fb5607', fillOpacity: 1
+                }}).addTo(mapRef).bindPopup('后续轨迹终点（车辆 ' + vehicleId + '）');
+                lookupLayers.push(endMarker);
+                return;
+            }}
+
+            var point = points[lookupIndex];
+            var nextPoint = points[lookupIndex + 1];
+            var coord = [point.lat, point.lng];
+
+            if (!lookupMarker) {{
+                lookupMarker = L.marker(coord, {{
+                    icon: L.icon({{
+                        iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png',
+                        iconSize: [25, 41], iconAnchor: [12, 41]
+                    }})
+                }}).addTo(mapRef);
+                var startMarker = L.circleMarker(coord, {{
+                    radius: 6, color: '#2b9348', fillColor: '#2b9348', fillOpacity: 1
+                }}).addTo(mapRef).bindPopup('后续轨迹起点（当前时刻）');
+                lookupLayers.push(startMarker);
+            }} else {{
+                lookupMarker.setLatLng(coord);
+            }}
+            lookupMarker.bindPopup(
+                '车辆ID: ' + vehicleId + '<br>速度: ' + point.speed + ' km/h<br>状态: ' +
+                (point.status === 1 ? '载客' : '空载') + '<br>时间: ' + point.time
+            );
+
+            if (lookupCurrentStatus === null || point.status !== lookupCurrentStatus) {{
+                startLookupSegment(point.status, coord);
+            }} else {{
+                lookupCurrentCoords.push(coord);
+                updateLookupSegment();
+            }}
+
+            if (lookupIndex % 5 === 0) {{
+                mapRef.panTo(coord, {{animate: true, duration: 0.4}});
+            }}
+
+            var speedFactor = window.trajectoryAnimSpeed || 200;
+            var delay = 1000 / speedFactor;
+            if (nextPoint) {{
+                var timeDiff = new Date(nextPoint.time) - new Date(point.time);
+                delay = Math.max(Math.min(timeDiff / speedFactor, 500), 16);
+            }}
+
+            lookupIndex++;
+            lookupTimer = setTimeout(function() {{ animateLookupStep(points, vehicleId); }}, delay);
+        }}
+
+        window.queryVehicleTrajectoryAfter = function(vehicleId, afterTimeStr) {{
+            if (!window.confirm('是否查看车辆 ' + vehicleId + ' 在此刻之后的轨迹？')) {{
+                return;
+            }}
+            fetch('/api/vehicle_trajectory?vehicle_id=' + encodeURIComponent(vehicleId)
+                  + '&start_time=' + encodeURIComponent(afterTimeStr))
+                .then(function(resp) {{ return resp.json(); }})
+                .then(function(data) {{
+                    if (data.error) {{
+                        window.alert('查询失败：' + data.error);
+                        return;
+                    }}
+                    if (!data.points || data.points.length === 0) {{
+                        window.alert('未查到该车后续轨迹数据');
+                        return;
+                    }}
+                    waitForMap(function() {{
+                        clearLookupLayers();
+                        document.getElementById('traj-speed-panel').style.display = 'block';
+
+                        var coords = data.points.map(function(p) {{ return [p.lat, p.lng]; }});
+                        mapRef.fitBounds(L.latLngBounds(coords), {{padding: [30, 30]}});
+
+                        animateLookupStep(data.points, vehicleId);
+                    }});
+                }})
+                .catch(function(err) {{
+                    window.alert('请求出错：' + err);
+                }});
+        }};
+    }})();
+    </script>
+    """
+
+
+def plot_minute_snapshot(time_str, vehicle_ids=None, max_vehicles=100, enable_trajectory_lookup=True):
     """
     绘制某一时刻的车辆位置分布
 
@@ -372,6 +545,7 @@ def plot_minute_snapshot(time_str, vehicle_ids=None, max_vehicles=100):
         time_str: 时间字符串
         vehicle_ids: 指定车辆ID列表（None表示所有车辆）
         max_vehicles: 最大显示车辆数（避免地图过于拥挤）
+        enable_trajectory_lookup: 是否开启"点击车辆 -> 弹窗确认 -> 当前页面查看后续轨迹"功能
 
     Returns:
         folium.Map: 地图对象
@@ -387,11 +561,32 @@ def plot_minute_snapshot(time_str, vehicle_ids=None, max_vehicles=100):
         df = df.sample(n=max_vehicles, random_state=42)
 
     m = create_base_map(title=f"车辆位置快照 ({time_str})")
+    map_js_name = m.get_name()
 
     # 添加车辆位置标记
     for _, row in df.iterrows():
         color = 'red' if row['status'] == 1 else 'blue'
         status_text = "载客" if row['status'] == 1 else "空载"
+        vehicle_id = int(row['id'])
+        time_str_iso = pd.to_datetime(row['time']).strftime('%Y-%m-%d %H:%M:%S')
+
+        if enable_trajectory_lookup:
+            # popup里加一个按钮，点击后触发"弹窗确认+当前页面画后续轨迹"的JS逻辑
+            popup_html = f"""
+            <div style="font-size:13px;line-height:1.7;">
+              车辆ID: {vehicle_id}<br>
+              状态: {status_text}<br>
+              速度: {row['speed']}km/h<br>
+              <button onclick="window.queryVehicleTrajectoryAfter({vehicle_id}, '{time_str_iso}')"
+                      style="margin-top:6px;padding:4px 12px;border:0;border-radius:6px;
+                             background:#0f6cbd;color:#fff;cursor:pointer;">
+                查看后续轨迹
+              </button>
+            </div>
+            """
+            popup = folium.Popup(popup_html, max_width=220)
+        else:
+            popup = f"车辆ID: {vehicle_id}<br>状态: {status_text}<br>速度: {row['speed']}km/h"
 
         folium.CircleMarker(
             location=[row['lati'], row['long']],
@@ -400,8 +595,11 @@ def plot_minute_snapshot(time_str, vehicle_ids=None, max_vehicles=100):
             fill=True,
             fillColor=color,
             fillOpacity=0.7,
-            popup=f"车辆ID: {int(row['id'])}<br>状态: {status_text}<br>速度: {row['speed']}km/h"
+            popup=popup
         ).add_to(m)
+
+    if enable_trajectory_lookup:
+        m.get_root().html.add_child(folium.Element(_build_trajectory_lookup_js(map_js_name)))
 
     return m
 
