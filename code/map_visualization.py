@@ -241,7 +241,7 @@ def plot_vehicle_trajectory(vehicle_id, start_time=None, end_time=None,
 
 def plot_multi_vehicle_trajectory(vehicle_ids, start_time=None, end_time=None, show_markers=True):
     """
-    在同一张地图上叠加多辆车轨迹。
+    在同一张地图上叠加多辆车轨迹（区分载客/空载状态）。
 
     Args:
         vehicle_ids: 车辆ID列表
@@ -274,28 +274,48 @@ def plot_multi_vehicle_trajectory(vehicle_ids, start_time=None, end_time=None, s
     for index, vehicle_id in enumerate(valid_vehicle_ids):
         color = MULTI_TRAJECTORY_COLORS[index % len(MULTI_TRAJECTORY_COLORS)]
         vehicle_df = merged[merged['query_vehicle_id'] == vehicle_id].sort_values('time').reset_index(drop=True)
-        points = vehicle_df[['lati', 'long']].values.tolist()
+        full_points = vehicle_df[['lati', 'long']].values.tolist()
 
         # 先铺一层白色描边，避免和彩色底图道路混在一起
         folium.PolyLine(
-            points,
+            full_points,
             color='#ffffff',
             weight=7,
             opacity=0.95,
             popup=None
         ).add_to(m)
 
-        folium.PolyLine(
-            points,
-            color=color,
-            weight=4,
-            opacity=0.98,
-            popup=f"车辆 {vehicle_id} 轨迹"
-        ).add_to(m)
+        # 按载客状态分段绘制，载客段更粗更实，空载段更细更透
+        vehicle_df['status_change'] = (vehicle_df['status'] != vehicle_df['status'].shift()).cumsum()
+
+        for _, group in vehicle_df.groupby('status_change'):
+            if len(group) < 2:
+                continue
+
+            points = group[['lati', 'long']].values.tolist()
+            status = group['status'].iloc[0]
+            status_text = "载客" if status == 1 else "空载"
+
+            if status == 1:
+                weight = 5
+                opacity = 0.98
+            else:
+                weight = 3
+                opacity = 0.55
+
+            folium.PolyLine(
+                points,
+                color=color,
+                weight=weight,
+                opacity=opacity,
+                popup=f"车辆 {vehicle_id} - {status_text}"
+            ).add_to(m)
 
         if show_markers and len(vehicle_df) > 0:
             start_point = vehicle_df.iloc[0]
             end_point = vehicle_df.iloc[-1]
+            start_status_text = "载客" if start_point['status'] == 1 else "空载"
+            end_status_text = "载客" if end_point['status'] == 1 else "空载"
             folium.CircleMarker(
                 [start_point['lati'], start_point['long']],
                 radius=5,
@@ -303,7 +323,7 @@ def plot_multi_vehicle_trajectory(vehicle_ids, start_time=None, end_time=None, s
                 fill=True,
                 fillColor=color,
                 fillOpacity=0.9,
-                popup=f"车辆 {vehicle_id} 起点<br>时间: {start_point['time']}"
+                popup=f"车辆 {vehicle_id} 起点<br>时间: {start_point['time']}<br>状态: {start_status_text}<br>速度: {start_point['speed']}km/h"
             ).add_to(m)
             folium.CircleMarker(
                 [end_point['lati'], end_point['long']],
@@ -312,7 +332,7 @@ def plot_multi_vehicle_trajectory(vehicle_ids, start_time=None, end_time=None, s
                 fill=True,
                 fillColor=color,
                 fillOpacity=0.5,
-                popup=f"车辆 {vehicle_id} 终点<br>时间: {end_point['time']}"
+                popup=f"车辆 {vehicle_id} 终点<br>时间: {end_point['time']}<br>状态: {end_status_text}<br>速度: {end_point['speed']}km/h"
             ).add_to(m)
 
     return m

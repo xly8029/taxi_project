@@ -78,13 +78,16 @@ def create_base_map(title: str):
     return m
 
 
-def scale_heat_weight(series: pd.Series, floor: float = 0.28) -> pd.Series:
+def scale_heat_weight(series: pd.Series, floor: float = 0.05) -> pd.Series:
     """把热力权重压缩到可见区间，避免弱点完全看不见。"""
     max_weight = series.max()
     if max_weight <= 0:
         return pd.Series([floor] * len(series), index=series.index)
 
-    normalized = (series / max_weight) ** 0.5
+    normalized = series / max_weight
+
+    # 使用平方增强高密度区域差异
+    normalized = normalized ** 2
     return floor + (1 - floor) * normalized
 
 
@@ -221,8 +224,8 @@ def _build_heat_time_slices(df: pd.DataFrame, time_col: str, lat_col: str, lon_c
             continue
         counts = points.copy()
         # 动态热力图进一步粗粒度聚合，降低前端每个时间片的点数，避免浏览器渲染失败
-        counts[lat_col] = counts[lat_col].round(3)
-        counts[lon_col] = counts[lon_col].round(3)
+        counts[lat_col] = counts[lat_col].round(4)
+        counts[lon_col] = counts[lon_col].round(4)
         counts = counts.groupby([lat_col, lon_col]).size().reset_index(name='weight')
         counts['weight'] = scale_heat_weight(counts['weight'])
         data.append(counts[[lat_col, lon_col, 'weight']].values.tolist())
@@ -316,7 +319,7 @@ def build_custom_dynamic_heatmap_html(title: str, data, time_labels, output_path
     const timeLabels = {json.dumps(time_labels, ensure_ascii=False)};
     const map = L.map('map').setView([{SHENZHEN_CENTER[0]}, {SHENZHEN_CENTER[1]}], 11);
     L.tileLayer('https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{ maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }}).addTo(map);
-    let heatLayer = L.heatLayer([], {{ radius: 28, blur: 22, maxZoom: 16, gradient: {{0.05:'#2b83ba',0.2:'#abdda4',0.45:'#ffffbf',0.7:'#fdae61',1.0:'#d7191c'}} }}).addTo(map);
+    let heatLayer = L.heatLayer([], {{ radius: 12, blur: 10, maxZoom: 16, minOpacity: 0.25, gradient: {{0.05:'#2b83ba',0.2:'#abdda4',0.45:'#ffffbf',0.7:'#fdae61',1.0:'#d7191c'}} }}).addTo(map);
     let timer = null;
     let currentIndex = 0;
 
@@ -394,6 +397,7 @@ def run_pickup_dbscan(output_name='pickup_dbscan_clusters.csv'):
 
 
 def build_dbscan_cluster_map(cluster_df: pd.DataFrame, output_name='05_pickup_dbscan_clusters.html'):
+    import numpy as np
     m = create_base_map('DBSCAN 上车点聚类中心图')
 
     if cluster_df.empty:
@@ -401,15 +405,19 @@ def build_dbscan_cluster_map(cluster_df: pd.DataFrame, output_name='05_pickup_db
         m.save(out_path)
         return out_path
 
+    max_count = cluster_df['count'].max()
     for _, row in cluster_df.iterrows():
-        radius = max(4, min(18, row['count'] / 2))
+        # 用 log 缩放半径，避免大聚类圆圈过大互相叠压，固定范围 4~12px
+        norm = np.log1p(row['count']) / np.log1p(max_count)
+        radius = 4 + norm * 8
         folium.CircleMarker(
             location=[row['lat'], row['lng']],
             radius=radius,
-            color='#8a1c7c',
+            color='#a00000',
             fill=True,
-            fillColor='#d63384',
-            fillOpacity=0.65,
+            fillColor='#e53935',
+            fillOpacity=0.7,
+            weight=1.5,
             popup=(
                 f"聚类中心<br>时间片: {row['time']}<br>"
                 f"权重: {int(row['count'])}<br>簇ID: {int(row['cluster_id'])}"
