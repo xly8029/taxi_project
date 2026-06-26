@@ -258,7 +258,7 @@ PAGE_TEMPLATE = """
         <div id="vehicle-section">
           <div class="field">
             <label for="vehicle_id">车辆 ID</label>
-            <input id="vehicle_id" name="vehicle_id" value="{{ form.vehicle_id }}" placeholder="例如 22223 或 22223,22224,22225">
+            <input id="vehicle_id" name="vehicle_id" value="{{ form.vehicle_id }}" placeholder="例如 22223，多辆车用逗号分隔 22223,22224">
           </div>
         </div>
 
@@ -310,7 +310,7 @@ PAGE_TEMPLATE = """
       <div class="panel tips">
         <h2>填写说明</h2>
         <div>车辆轨迹/动画轨迹：需要填 `车辆 ID`、`开始时间`、`结束时间`。</div>
-        <div>车辆轨迹模式支持一次输入多辆车，使用英文逗号分隔，例如 `22223,22224,22225`。</div>
+        <div>两种模式均支持多辆车，使用英文逗号分隔，例如 `22223,22224,22225`。</div>
         <div>分钟位置快照：需要填 `快照时间`，格式 `2013-10-22 08:00`。</div>
         <div>上下车点分布：填写时间范围，系统从 OD 缓存中抽样展示。</div>
         <div>地图选点工具：不需要填参数，打开后直接点击地图取点。</div>
@@ -615,9 +615,11 @@ def _build_map(form):
         return plot_od_points(form['start_time'], form['end_time'], max_points=max_points)
 
     if mode == 'animation':
-        vehicle_id = int(form['vehicle_id'])
+        vehicle_ids = [int(x.strip()) for x in form['vehicle_id'].split(',') if x.strip()]
+        if not vehicle_ids:
+            raise ValueError('请至少输入一个车辆 ID')
         speed_factor = int(form['speed_factor'])
-        return create_animated_trajectory(vehicle_id, form['start_time'], form['end_time'], speed_factor=speed_factor)
+        return create_animated_trajectory(vehicle_ids, form['start_time'], form['end_time'], speed_factor=speed_factor)
 
     if mode == 'point_picker':
         return create_point_picker_map()

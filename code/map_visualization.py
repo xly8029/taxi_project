@@ -670,13 +670,12 @@ def plot_od_points(start_time=None, end_time=None, max_points=200):
 
 
 # --------------------------- 5. 单车动画轨迹 ---------------------------
-def create_animated_trajectory(vehicle_id, start_time=None, end_time=None,
-                               speed_factor=100):
+def create_animated_trajectory(vehicle_ids, start_time=None, end_time=None, speed_factor=100):
     """
-    创建单车动画轨迹（车辆图标沿轨迹移动）
+    创建多车动画轨迹（支持单车或多车，各车图标同步沿轨迹移动）
 
     Args:
-        vehicle_id: 车辆ID
+        vehicle_ids: 车辆ID（int）或车辆ID列表（list of int）
         start_time: 开始时间
         end_time: 结束时间
         speed_factor: 动画速度倍数（越大越快）
@@ -684,155 +683,247 @@ def create_animated_trajectory(vehicle_id, start_time=None, end_time=None,
     Returns:
         folium.Map: 包含动画的地图对象
     """
-    df = load_vehicle_trajectory(vehicle_id, start_time, end_time)
+    import json as _json
 
-    if df.empty or len(df) < 2:
-        raise ValueError(f"车辆 {vehicle_id} 在指定时间段内数据不足")
+    if isinstance(vehicle_ids, int):
+        vehicle_ids = [vehicle_ids]
 
-    # 动态轨迹不按整条轨迹缩放，而是按当前车辆位置跟随展示
-    first_point = df.iloc[0]
-    center_lat = first_point['lati']
-    center_lon = first_point['long']
+    # 加载所有车辆数据
+    all_vehicles = []
+    for vid in vehicle_ids:
+        try:
+            df = load_vehicle_trajectory(vid, start_time, end_time)
+            if df.empty or len(df) < 2:
+                continue
+            pts = [
+                {
+                    'lat': float(row['lati']),
+                    'lon': float(row['long']),
+                    'time': row['time'].isoformat(),
+                    'speed': float(row['speed']),
+                    'status': int(row['status']),
+                }
+                for _, row in df.iterrows()
+            ]
+            all_vehicles.append({'id': vid, 'points': pts})
+        except FileNotFoundError:
+            continue
+
+    if not all_vehicles:
+        raise ValueError('所有车辆在指定时间段内数据不足')
+
+    # 地图中心取第一辆车起点
+    first_pt = all_vehicles[0]['points'][0]
     m = create_base_map(
-        center=[center_lat, center_lon],
-        title=f"车辆 {vehicle_id} 动画轨迹"
+        center=[first_pt['lat'], first_pt['lon']],
+        title=f"动画轨迹（{'、'.join(str(v['id']) for v in all_vehicles)}）"
     )
-    m.location = [center_lat, center_lon]
-    m.options['zoom'] = 15
+    m.options['zoom'] = 14
     map_js_name = m.get_name()
 
-    # 准备轨迹数据
-    points = []
-    for _, row in df.iterrows():
-        points.append({
-            'lat': row['lati'],
-            'lon': row['long'],
-            'time': row['time'].isoformat(),
-            'speed': float(row['speed']),
-            'status': int(row['status'])
-        })
+    colors_js = _json.dumps(MULTI_TRAJECTORY_COLORS)
+    vehicles_js = _json.dumps(all_vehicles, ensure_ascii=False)
 
-    # 生成JavaScript动画代码
     animation_js = f"""
-    <script>
-    var points = {json.dumps(points)};
-    var currentIndex = 0;
-    var marker = null;
-    var currentStatus = null;
-    var currentOuterLine = null;
-    var currentMidLine = null;
-    var currentInnerLine = null;
-    var currentCoords = [];
-    var mapInstance = null;
+<script>
+(function() {{
+  var COLORS = {colors_js};
+  var allVehicles = {vehicles_js};
+  var speedFactor = {speed_factor};
+  var mapInstance = null;
+  var isPlaying = true;
+  var animTimer = null;
 
-    function waitForMap(callback) {{
-        if (typeof {map_js_name} !== 'undefined' && {map_js_name}) {{
-            mapInstance = {map_js_name};
-            callback();
-        }} else {{
-            setTimeout(function() {{ waitForMap(callback); }}, 100);
-        }}
-    }}
+  // 每辆车的状态
+  var vehicles = allVehicles.map(function(v, i) {{
+    return {{
+      id: v.id,
+      points: v.points,
+      color: COLORS[i % COLORS.length],
+      index: 0,
+      marker: null,
+      outerLine: null,
+      innerLine: null,
+      allLines: [],        // 记录该车所有已绘制的线段，供重置时清除
+      currentCoords: [],
+      currentStatus: null
+    }};
+  }});
 
-    function initAnimation() {{
-        var firstPoint = points[0];
-        mapInstance.setView([firstPoint.lat, firstPoint.lon], 15);
+  function waitForMap(cb) {{
+    if (typeof {map_js_name} !== 'undefined' && {map_js_name}) cb({map_js_name});
+    else setTimeout(function() {{ waitForMap(cb); }}, 100);
+  }}
 
-        // 创建车辆标记
-        marker = L.marker([firstPoint.lat, firstPoint.lon], {{
-            icon: L.icon({{
-                iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png',
-                iconSize: [25, 41],
-                iconAnchor: [12, 41]
-            }})
-        }}).addTo(mapInstance);
-
-        marker.bindPopup('车辆ID: {vehicle_id}<br>速度: ' + firstPoint.speed + ' km/h<br>状态: ' + 
-                        (firstPoint.status === 1 ? '载客' : '空载'));
-
-        // 开始动画
-        animateVehicle();
-    }}
-
-    function startNewSegment(status, startCoord) {{
-        currentStatus = status;
-        currentCoords = [startCoord];
-
-        if (status === 1) {{
-            currentOuterLine = L.polyline([], {{color: '{GLOW_OCCUPIED}', weight: 10, opacity: 0.9}}).addTo(mapInstance);
-            currentMidLine = L.polyline([], {{color: '#ffffff', weight: 6.8, opacity: 0.94}}).addTo(mapInstance);
-            currentInnerLine = L.polyline([], {{color: '{TRAJECTORY_BASE_COLOR}', weight: 3.2, opacity: 0.98}}).addTo(mapInstance);
-        }} else {{
-            currentOuterLine = null;
-            currentMidLine = null;
-            currentInnerLine = L.polyline([], {{color: '{TRAJECTORY_BASE_COLOR}', weight: 3.2, opacity: 0.9}}).addTo(mapInstance);
-        }}
-
-        updateCurrentSegment();
-    }}
-
-    function updateCurrentSegment() {{
-        if (currentOuterLine) {{
-            currentOuterLine.setLatLngs(currentCoords);
-        }}
-        if (currentMidLine) {{
-            currentMidLine.setLatLngs(currentCoords);
-        }}
-        if (currentInnerLine) {{
-            currentInnerLine.setLatLngs(currentCoords);
-        }}
-    }}
-
-    function animateVehicle() {{
-        if (currentIndex >= points.length) {{
-            return;
-        }}
-
-        var point = points[currentIndex];
-        var nextPoint = points[currentIndex + 1];
-
-        // 更新标记位置
-        marker.setLatLng([point.lat, point.lon]);
-        if (currentIndex % 5 === 0 || currentIndex === 0) {{
-            mapInstance.panTo([point.lat, point.lon], {{animate: true, duration: 0.45}});
-        }}
-        marker.setPopupContent('车辆ID: {vehicle_id}<br>速度: ' + point.speed + 
-                              ' km/h<br>状态: ' + (point.status === 1 ? '载客' : '空载') +
-                              '<br>时间: ' + point.time);
-
-        // 更新轨迹线：状态一旦切换，就新开一段，避免跨状态拉直线
-        var currentCoord = [point.lat, point.lon];
-        if (currentStatus === null || point.status !== currentStatus) {{
-            startNewSegment(point.status, currentCoord);
-        }} else {{
-            currentCoords.push(currentCoord);
-            updateCurrentSegment();
-        }}
-
-        // 根据速度和时间差计算延迟
-        var delay = 1000 / {speed_factor};  // 基础延迟
-        if (nextPoint) {{
-            var timeDiff = new Date(nextPoint.time) - new Date(point.time);
-            delay = Math.min(timeDiff / {speed_factor}, 500);  // 限制最大延迟
-        }}
-
-        currentIndex++;
-        setTimeout(animateVehicle, delay);
-    }}
-
-    // 等待地图加载完成后启动动画
-    waitForMap(function() {{
-        mapInstance.whenReady(function() {{
-            setTimeout(initAnimation, 1000);
-        }});
+  function initVehicles(map) {{
+    mapInstance = map;
+    vehicles.forEach(function(v) {{
+      var fp = v.points[0];
+      var carIcon = L.divIcon({{
+        html: '<div style="width:14px;height:14px;border-radius:50%;background:' + v.color +
+              ';border:2px solid #fff;box-shadow:0 0 4px rgba(0,0,0,0.5)"></div>',
+        iconSize: [14, 14], iconAnchor: [7, 7], className: ''
+      }});
+      v.marker = L.marker([fp.lat, fp.lon], {{ icon: carIcon }}).addTo(map);
+      v.marker.bindTooltip('车辆 ' + v.id, {{ permanent: false, direction: 'top' }});
     }});
-    </script>
-    """
 
+    // 控制面板
+    var panel = L.control({{ position: 'bottomleft' }});
+    panel.onAdd = function() {{
+      var div = L.DomUtil.create('div');
+      div.style.cssText = 'background:rgba(15,23,42,0.88);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:10px 14px;color:#e2e8f0;font-family:Microsoft YaHei,sans-serif;min-width:200px';
+      div.innerHTML =
+        '<div style="font-size:13px;font-weight:700;margin-bottom:8px;color:#f8fafc">▐ 动画轨迹控制</div>' +
+        '<div id="anim-time" style="font-size:12px;color:#94a3b8;margin-bottom:8px">准备中…</div>' +
+        '<div style="display:flex;gap:8px">' +
+          '<button id="anim-play" onclick="window._animToggle()" style="flex:1;background:#0ea5e9;color:#fff;border:none;border-radius:7px;padding:6px 10px;cursor:pointer;font-size:12px">⏸ 暂停</button>' +
+          '<button onclick="window._animReset()" style="background:rgba(255,255,255,0.1);color:#cbd5e1;border:none;border-radius:7px;padding:6px 10px;cursor:pointer;font-size:12px">↺ 重置</button>' +
+        '</div>' +
+        '<div style="margin-top:10px">' + vehicles.map(function(v) {{
+          return '<div style="display:flex;align-items:center;gap:6px;margin-top:4px">' +
+            '<div style="width:10px;height:10px;border-radius:50%;background:' + v.color + '"></div>' +
+            '<span style="font-size:12px;color:#94a3b8">车辆 ' + v.id + '</span></div>';
+        }}).join('') + '</div>';
+      L.DomEvent.disableClickPropagation(div);
+      return div;
+    }};
+    panel.addTo(map);
+
+    startAnimation();
+  }}
+
+  function startNewSegment(v, status, coord) {{
+    // 旧段保留在地图上，只新建当前段的两层线
+    v.currentStatus = status;
+    v.currentCoords = [coord];
+
+    // 空载：白边 + 彩色主线虚线
+    // 载客：黑边 + 彩色主线实线
+    var borderColor = status === 1 ? '#111111' : '#ffffff';
+    var borderW    = status === 1 ? 6.5 : 5.5;
+    var innerW     = status === 1 ? 3.5 : 2.5;
+    var innerOpacity = status === 1 ? 0.98 : 0.70;
+    var dash       = status === 1 ? null : '7,5';
+
+    v.outerLine = L.polyline([coord], {{
+      color: borderColor, weight: borderW, opacity: 0.88
+    }}).addTo(mapInstance);
+    v.innerLine = L.polyline([coord], {{
+      color: v.color, weight: innerW, opacity: innerOpacity, dashArray: dash
+    }}).addTo(mapInstance);
+
+    // 记录到 allLines 以便重置时精确清除
+    v.allLines.push(v.outerLine, v.innerLine);
+  }}
+
+  function stepVehicle(v) {{
+    if (v.index >= v.points.length) return false;
+    var pt = v.points[v.index];
+    var coord = [pt.lat, pt.lon];
+
+    v.marker.setLatLng(coord);
+    v.marker.setTooltipContent(
+      '车辆 ' + v.id + '<br>' + (pt.status === 1 ? '载客' : '空载') +
+      ' ' + pt.speed + ' km/h<br>' + pt.time.replace('T', ' ').slice(0,19)
+    );
+
+    if (v.currentStatus === null || pt.status !== v.currentStatus) {{
+      startNewSegment(v, pt.status, coord);
+    }} else {{
+      v.currentCoords.push(coord);
+      if (v.outerLine) v.outerLine.setLatLngs(v.currentCoords);
+      if (v.innerLine) v.innerLine.setLatLngs(v.currentCoords);
+    }}
+
+    v.index++;
+    return v.index < v.points.length;
+  }}
+
+  // ── 全局时间轴 ─────────────────────────────────────────────────────────
+  // 收集所有车辆的时间戳，去重排序，建立统一时间轴
+  var allTimes = [];
+  vehicles.forEach(function(v) {{
+    v.points.forEach(function(p) {{ allTimes.push(new Date(p.time).getTime()); }});
+  }});
+  allTimes = allTimes.filter(function(v,i,a){{ return a.indexOf(v)===i; }}).sort(function(a,b){{return a-b;}});
+  var globalIndex = 0;
+
+  function startAnimation() {{
+    if (animTimer) clearTimeout(animTimer);
+
+    function tick() {{
+      if (!isPlaying) return;
+      if (globalIndex >= allTimes.length) return;
+
+      var globalNow = allTimes[globalIndex];
+
+      // 各车消费所有 time <= globalNow 的数据点，保持各车时间和全局时间同步
+      vehicles.forEach(function(v) {{
+        while (v.index < v.points.length &&
+               new Date(v.points[v.index].time).getTime() <= globalNow) {{
+          stepVehicle(v);
+        }}
+      }});
+
+      // 控制框统一显示全局时间
+      var el = document.getElementById('anim-time');
+      if (el) {{
+        var d = new Date(globalNow);
+        // 用本地时间显示，避免 toISOString() 转 UTC 导致时差偏移
+        var pad = function(n){{ return n < 10 ? '0'+n : ''+n; }};
+        el.textContent = d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+
+          ' '+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());
+      }}
+
+      // 地图视野跟随第一辆车
+      var lead = vehicles[0];
+      if (lead.index > 0 && globalIndex % 4 === 0) {{
+        var lp = lead.points[Math.min(lead.index, lead.points.length - 1)];
+        mapInstance.panTo([lp.lat, lp.lon], {{ animate: true, duration: 0.4 }});
+      }}
+
+      globalIndex++;
+
+      var delay = 50;
+      if (globalIndex < allTimes.length) {{
+        delay = Math.min(500, Math.max(16,
+          (allTimes[globalIndex] - globalNow) / speedFactor));
+      }}
+      animTimer = setTimeout(tick, delay);
+    }}
+
+    animTimer = setTimeout(tick, 800);
+  }}
+
+  window._animToggle = function() {{
+    isPlaying = !isPlaying;
+    var btn = document.getElementById('anim-play');
+    if (isPlaying) {{ btn.textContent = '⏸ 暂停'; startAnimation(); }}
+    else {{ btn.textContent = '▶ 播放'; if (animTimer) clearTimeout(animTimer); }}
+  }};
+
+  window._animReset = function() {{
+    if (animTimer) clearTimeout(animTimer);
+    // 精确移除所有已绘制的轨迹线，不影响底图和标记
+    vehicles.forEach(function(v) {{
+      v.allLines.forEach(function(l) {{ mapInstance.removeLayer(l); }});
+      v.index = 0; v.currentStatus = null; v.currentCoords = [];
+      v.allLines = []; v.outerLine = null; v.innerLine = null;
+      if (v.points.length) v.marker.setLatLng([v.points[0].lat, v.points[0].lon]);
+    }});
+    globalIndex = 0;
+    isPlaying = true;
+    document.getElementById('anim-play').textContent = '⏸ 暂停';
+    startAnimation();
+  }};
+
+  waitForMap(initVehicles);
+}})();
+</script>
+"""
     m.get_root().html.add_child(folium.Element(animation_js))
-
     return m
-
 
 # --------------------------- 6. 地图选点功能（为路网校正和ETA预留） ---------------------------
 def create_point_picker_map():
