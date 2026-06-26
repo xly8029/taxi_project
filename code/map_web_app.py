@@ -226,6 +226,7 @@ PAGE_TEMPLATE = """
       timeRangeSection.style.display = ['trajectory', 'od_points', 'animation'].includes(mode) ? 'block' : 'none';
       minuteSection.style.display = mode === 'snapshot' ? 'block' : 'none';
       maxVehiclesSection.style.display = mode === 'snapshot' ? 'block' : 'none';
+      document.getElementById('snapshot-filter-section').style.display = mode === 'snapshot' ? 'block' : 'none';
       odSection.style.display = mode === 'od_points' ? 'block' : 'none';
       animationSection.style.display = mode === 'animation' ? 'block' : 'none';
     }
@@ -284,6 +285,25 @@ PAGE_TEMPLATE = """
           <div class="field">
             <label for="max_vehicles">最多显示车辆数</label>
             <input id="max_vehicles" name="max_vehicles" value="{{ form.max_vehicles }}" placeholder="500">
+          </div>
+        </div>
+
+        <div id="snapshot-filter-section" style="display:none">
+          <div class="field">
+            <label for="id_min">车辆 ID 下限（含，留空不限）</label>
+            <input id="id_min" name="id_min" value="{{ form.id_min }}" placeholder="例如 22000">
+          </div>
+          <div class="field">
+            <label for="id_max">车辆 ID 上限（含，留空不限）</label>
+            <input id="id_max" name="id_max" value="{{ form.id_max }}" placeholder="例如 23000">
+          </div>
+          <div class="field">
+            <label for="status_filter">载客状态</label>
+            <select id="status_filter" name="status_filter">
+              <option value="" {% if form.status_filter == '' %}selected{% endif %}>全部</option>
+              <option value="1" {% if form.status_filter == '1' %}selected{% endif %}>仅载客</option>
+              <option value="0" {% if form.status_filter == '0' %}selected{% endif %}>仅空载</option>
+            </select>
           </div>
         </div>
 
@@ -580,6 +600,9 @@ def _default_form():
         'end_time': '2013-10-22 10:00:00',
         'snapshot_time': '2013-10-22 08:00',
         'max_vehicles': '500',
+        'id_min': '',
+        'id_max': '',
+        'status_filter': '',
         'max_points': '300',
         'speed_factor': '200',
     }
@@ -607,8 +630,17 @@ def _build_map(form):
         return plot_multi_vehicle_trajectory(vehicle_ids, form['start_time'], form['end_time'])
 
     if mode == 'snapshot':
-        max_vehicles = int(form['max_vehicles'])
-        return plot_minute_snapshot(form['snapshot_time'], max_vehicles=max_vehicles)
+        max_vehicles = int(form.get('max_vehicles', 500) or 500)
+        id_min = int(form['id_min']) if form.get('id_min') else None
+        id_max = int(form['id_max']) if form.get('id_max') else None
+        status_filter = int(form['status_filter']) if form.get('status_filter') != '' and form.get('status_filter') is not None else None
+        return plot_minute_snapshot(
+            form['snapshot_time'],
+            max_vehicles=max_vehicles,
+            id_min=id_min,
+            id_max=id_max,
+            status_filter=status_filter,
+        )
 
     if mode == 'od_points':
         max_points = int(form['max_points'])
@@ -674,6 +706,9 @@ def index():
             'end_time': request.form.get('end_time', form['end_time']).strip(),
             'snapshot_time': request.form.get('snapshot_time', form['snapshot_time']).strip(),
             'max_vehicles': request.form.get('max_vehicles', form['max_vehicles']).strip(),
+            'id_min': request.form.get('id_min', '').strip(),
+            'id_max': request.form.get('id_max', '').strip(),
+            'status_filter': request.form.get('status_filter', '').strip(),
             'max_points': request.form.get('max_points', form['max_points']).strip(),
             'speed_factor': request.form.get('speed_factor', form['speed_factor']).strip(),
         })

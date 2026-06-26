@@ -379,6 +379,11 @@ def _build_trajectory_lookup_js(map_js_name):
              任意数字，默认200），动画播放过程中随时可以改，下一帧就会用上新速度，不用重新查询
         4. 每次点新的车辆前，会先清掉上一次的动画轨迹和计时器，避免画面里叠了一堆线、
            或者上一次动画还在后台偷偷继续跑
+        5. 注意：点击"查看后续轨迹"后用的是 fitBounds 把视野缩放到这条轨迹范围，
+           原来分钟快照里的其他车辆标记并没有被删除，只是因为视野缩小/平移而看不见了
+           （"消失"是视觉上的，不是真的被移除）。所以加一个"返回"按钮：
+           记录第一次进入时的地图中心点和缩放级别，点击返回按钮时把视野恢复回去，
+           同时清掉这条后续轨迹和动画，回到最初的分钟快照效果。
     """
     return f"""
     <div id="traj-speed-panel" style="display:none; position:fixed; top:70px; right:10px; z-index:9999;
@@ -387,6 +392,11 @@ def _build_trajectory_lookup_js(map_js_name):
       <div style="margin-bottom:6px; color:#333;">动画速度倍数</div>
       <input id="traj-speed-input" type="number" min="1" step="1" value="200" placeholder="200"
              style="width:90px;padding:5px 8px;border:1px solid #ccc;border-radius:6px;font-size:13px;">
+      <button id="traj-back-btn"
+              style="margin-top:10px;width:100%;padding:6px 0;border:0;border-radius:6px;
+                     background:#475569;color:#fff;cursor:pointer;font-size:13px;">
+        ← 返回原来的显示
+      </button>
     </div>
     <script>
     (function() {{
@@ -399,12 +409,19 @@ def _build_trajectory_lookup_js(map_js_name):
         var lookupCurrentCoords = [];
         var lookupOuterLine = null;
         var lookupInnerLine = null;
+        var originalCenter = null;
+        var originalZoom = null;
 
         window.trajectoryAnimSpeed = 200;  // 默认倍速，和单车动画轨迹的默认值保持一致
 
         function waitForMap(callback) {{
             if (typeof {map_js_name} !== 'undefined' && {map_js_name}) {{
                 mapRef = {map_js_name};
+                if (originalCenter === null) {{
+                    // 只在第一次拿到地图实例时记录初始视野，后续多次查询不会被覆盖
+                    originalCenter = mapRef.getCenter();
+                    originalZoom = mapRef.getZoom();
+                }}
                 callback();
             }} else {{
                 setTimeout(function() {{ waitForMap(callback); }}, 100);
@@ -419,6 +436,19 @@ def _build_trajectory_lookup_js(map_js_name):
                 if (!isNaN(v) && v > 0) {{
                     window.trajectoryAnimSpeed = v;
                 }}
+            }}
+        }});
+
+        // 返回按钮：恢复最初的地图视野，并清掉当前画的后续轨迹/动画
+        document.addEventListener('click', function(e) {{
+            if (e.target && e.target.id === 'traj-back-btn') {{
+                waitForMap(function() {{
+                    clearLookupLayers();
+                    document.getElementById('traj-speed-panel').style.display = 'none';
+                    if (originalCenter) {{
+                        mapRef.setView(originalCenter, originalZoom);
+                    }}
+                }});
             }}
         }});
 
@@ -537,30 +567,51 @@ def _build_trajectory_lookup_js(map_js_name):
     """
 
 
-def plot_minute_snapshot(time_str, vehicle_ids=None, max_vehicles=100, enable_trajectory_lookup=True):
+def plot_minute_snapshot(time_str, vehicle_ids=None, max_vehicles=500,
+                         id_min=None, id_max=None, status_filter=None,
+                         enable_trajectory_lookup=True):
     """
     绘制某一时刻的车辆位置分布
 
     Args:
         time_str: 时间字符串
         vehicle_ids: 指定车辆ID列表（None表示所有车辆）
-        max_vehicles: 最大显示车辆数（避免地图过于拥挤）
-        enable_trajectory_lookup: 是否开启"点击车辆 -> 弹窗确认 -> 当前页面查看后续轨迹"功能
+        max_vehicles: 最大显示车辆数
+        id_min: 车辆ID下限（含），None表示不限
+        id_max: 车辆ID上限（含），None表示不限
+        status_filter: None=全部, 1=仅载客, 0=仅空载
+        enable_trajectory_lookup: 是否开启点击查看后续轨迹功能
 
     Returns:
         folium.Map: 地图对象
     """
     df = load_minute_snapshot(time_str)
 
-    # 筛选指定车辆
+    # 筛选指定 ID 列表
     if vehicle_ids:
         df = df[df['id'].isin(vehicle_ids)]
+
+    # 筛选 ID 范围
+    if id_min is not None:
+        df = df[df['id'] >= int(id_min)]
+    if id_max is not None:
+        df = df[df['id'] <= int(id_max)]
+
+    # 筛选载客状态
+    if status_filter is not None:
+        df = df[df['status'] == int(status_filter)]
 
     # 限制显示数量
     if len(df) > max_vehicles:
         df = df.sample(n=max_vehicles, random_state=42)
 
-    m = create_base_map(title=f"车辆位置快照 ({time_str})")
+    filter_desc = []
+    if id_min is not None: filter_desc.append(f"ID≥{id_min}")
+    if id_max is not None: filter_desc.append(f"ID≤{id_max}")
+    if status_filter == 1: filter_desc.append("载客")
+    elif status_filter == 0: filter_desc.append("空载")
+    filter_str = f"  [{', '.join(filter_desc)}]" if filter_desc else ""
+    m = create_base_map(title=f"车辆位置快照 ({time_str}){filter_str}  共 {len(df)} 辆")
     map_js_name = m.get_name()
 
     # 添加车辆位置标记
@@ -687,6 +738,9 @@ def create_animated_trajectory(vehicle_ids, start_time=None, end_time=None, spee
 
     if isinstance(vehicle_ids, int):
         vehicle_ids = [vehicle_ids]
+
+    if len(vehicle_ids) > 10:
+        raise ValueError(f'动画模式最多支持 10 辆车，当前输入了 {len(vehicle_ids)} 辆，请减少车辆数量')
 
     # 加载所有车辆数据
     all_vehicles = []
