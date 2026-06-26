@@ -411,6 +411,7 @@ def _build_trajectory_lookup_js(map_js_name):
         var lookupInnerLine = null;
         var originalCenter = null;
         var originalZoom = null;
+        var savedMarkers = [];  // 保存分钟快照的全部车辆标记
 
         window.trajectoryAnimSpeed = 200;  // 默认倍速，和单车动画轨迹的默认值保持一致
 
@@ -421,6 +422,12 @@ def _build_trajectory_lookup_js(map_js_name):
                     // 只在第一次拿到地图实例时记录初始视野，后续多次查询不会被覆盖
                     originalCenter = mapRef.getCenter();
                     originalZoom = mapRef.getZoom();
+                    // 保存所有车辆标记（CircleMarker），用于轨迹查看时隐藏
+                    mapRef.eachLayer(function(layer) {{
+                        if (layer instanceof L.CircleMarker) {{
+                            savedMarkers.push(layer);
+                        }}
+                    }});
                 }}
                 callback();
             }} else {{
@@ -439,11 +446,13 @@ def _build_trajectory_lookup_js(map_js_name):
             }}
         }});
 
-        // 返回按钮：恢复最初的地图视野，并清掉当前画的后续轨迹/动画
+        // 返回按钮：恢复全部车辆标记、地图视野，并清掉当前画的后续轨迹/动画
         document.addEventListener('click', function(e) {{
             if (e.target && e.target.id === 'traj-back-btn') {{
                 waitForMap(function() {{
                     clearLookupLayers();
+                    // 恢复所有被隐藏的车辆标记
+                    savedMarkers.forEach(function(m) {{ m.addTo(mapRef); }});
                     document.getElementById('traj-speed-panel').style.display = 'none';
                     if (originalCenter) {{
                         mapRef.setView(originalCenter, originalZoom);
@@ -550,6 +559,8 @@ def _build_trajectory_lookup_js(map_js_name):
                     }}
                     waitForMap(function() {{
                         clearLookupLayers();
+                        // 隐藏全部车辆标记，只保留当前查看的车辆
+                        savedMarkers.forEach(function(m) {{ mapRef.removeLayer(m); }});
                         document.getElementById('traj-speed-panel').style.display = 'block';
 
                         var coords = data.points.map(function(p) {{ return [p.lat, p.lng]; }});
