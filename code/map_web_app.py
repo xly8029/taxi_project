@@ -28,6 +28,7 @@ from map_visualization import (
     plot_od_points,
     create_animated_trajectory,
     create_point_picker_map,
+    plot_corrected_trajectory,
 )
 
 
@@ -221,14 +222,15 @@ PAGE_TEMPLATE = """
       const maxVehiclesSection = document.getElementById('max-vehicles-section');
       const odSection = document.getElementById('od-section');
       const animationSection = document.getElementById('animation-section');
+      const roadCorrectionSection = document.getElementById('road-correction-section');
 
-      vehicleSection.style.display = ['trajectory', 'animation'].includes(mode) ? 'block' : 'none';
-      timeRangeSection.style.display = ['trajectory', 'od_points', 'animation'].includes(mode) ? 'block' : 'none';
+      vehicleSection.style.display = ['trajectory', 'animation', 'road_correction'].includes(mode) ? 'block' : 'none';
+      timeRangeSection.style.display = ['trajectory', 'od_points', 'animation', 'road_correction'].includes(mode) ? 'block' : 'none';
       minuteSection.style.display = mode === 'snapshot' ? 'block' : 'none';
       maxVehiclesSection.style.display = mode === 'snapshot' ? 'block' : 'none';
-      document.getElementById('snapshot-filter-section').style.display = mode === 'snapshot' ? 'block' : 'none';
       odSection.style.display = mode === 'od_points' ? 'block' : 'none';
       animationSection.style.display = mode === 'animation' ? 'block' : 'none';
+      roadCorrectionSection.style.display = mode === 'road_correction' ? 'block' : 'none';
     }
 
     window.addEventListener('DOMContentLoaded', onModeChange);
@@ -252,6 +254,7 @@ PAGE_TEMPLATE = """
             <option value="snapshot" {% if form.mode == 'snapshot' %}selected{% endif %}>分钟位置快照</option>
             <option value="od_points" {% if form.mode == 'od_points' %}selected{% endif %}>上下车点分布</option>
             <option value="animation" {% if form.mode == 'animation' %}selected{% endif %}>动画轨迹</option>
+            <option value="road_correction" {% if form.mode == 'road_correction' %}selected{% endif %}>路网校正轨迹</option>
             <option value="point_picker" {% if form.mode == 'point_picker' %}selected{% endif %}>地图选点工具</option>
           </select>
         </div>
@@ -288,25 +291,6 @@ PAGE_TEMPLATE = """
           </div>
         </div>
 
-        <div id="snapshot-filter-section" style="display:none">
-          <div class="field">
-            <label for="id_min">车辆 ID 下限（含，留空不限）</label>
-            <input id="id_min" name="id_min" value="{{ form.id_min }}" placeholder="例如 22000">
-          </div>
-          <div class="field">
-            <label for="id_max">车辆 ID 上限（含，留空不限）</label>
-            <input id="id_max" name="id_max" value="{{ form.id_max }}" placeholder="例如 23000">
-          </div>
-          <div class="field">
-            <label for="status_filter">载客状态</label>
-            <select id="status_filter" name="status_filter">
-              <option value="" {% if form.status_filter == '' %}selected{% endif %}>全部</option>
-              <option value="1" {% if form.status_filter == '1' %}selected{% endif %}>仅载客</option>
-              <option value="0" {% if form.status_filter == '0' %}selected{% endif %}>仅空载</option>
-            </select>
-          </div>
-        </div>
-
         <div id="od-section">
           <div class="field">
             <label for="max_points">最多显示订单点数</label>
@@ -318,6 +302,23 @@ PAGE_TEMPLATE = """
           <div class="field">
             <label for="speed_factor">动画速度倍数</label>
             <input id="speed_factor" name="speed_factor" value="{{ form.speed_factor }}" placeholder="200">
+          </div>
+        </div>
+
+        <div id="road-correction-section">
+          <div class="field">
+            <label>
+              <input type="checkbox" name="enable_correction" value="1"
+                     {% if form.enable_correction %}checked{% endif %}>
+              启用路网校正（取消勾选仅显示原始轨迹）
+            </label>
+          </div>
+          <div class="field">
+            <label>
+              <input type="checkbox" name="use_undirected" value="1"
+                     {% if form.use_undirected %}checked{% endif %}>
+              使用无向图做最短路径（有向图不可达时自动回退）
+            </label>
           </div>
         </div>
 
@@ -333,6 +334,7 @@ PAGE_TEMPLATE = """
         <div>两种模式均支持多辆车，使用英文逗号分隔，例如 `22223,22224,22225`。</div>
         <div>分钟位置快照：需要填 `快照时间`，格式 `2013-10-22 08:00`。</div>
         <div>上下车点分布：填写时间范围，系统从 OD 缓存中抽样展示。</div>
+        <div>路网校正轨迹：填 1-3 辆车 ID 和短时间窗口，建议 ≤30 分钟。</div>
         <div>地图选点工具：不需要填参数，打开后直接点击地图取点。</div>
       </div>
     </aside>
@@ -600,11 +602,10 @@ def _default_form():
         'end_time': '2013-10-22 10:00:00',
         'snapshot_time': '2013-10-22 08:00',
         'max_vehicles': '500',
-        'id_min': '',
-        'id_max': '',
-        'status_filter': '',
         'max_points': '300',
         'speed_factor': '200',
+        'enable_correction': True,
+        'use_undirected': False,
     }
 
 
@@ -630,17 +631,8 @@ def _build_map(form):
         return plot_multi_vehicle_trajectory(vehicle_ids, form['start_time'], form['end_time'])
 
     if mode == 'snapshot':
-        max_vehicles = int(form.get('max_vehicles', 500) or 500)
-        id_min = int(form['id_min']) if form.get('id_min') else None
-        id_max = int(form['id_max']) if form.get('id_max') else None
-        status_filter = int(form['status_filter']) if form.get('status_filter') != '' and form.get('status_filter') is not None else None
-        return plot_minute_snapshot(
-            form['snapshot_time'],
-            max_vehicles=max_vehicles,
-            id_min=id_min,
-            id_max=id_max,
-            status_filter=status_filter,
-        )
+        max_vehicles = int(form['max_vehicles'])
+        return plot_minute_snapshot(form['snapshot_time'], max_vehicles=max_vehicles)
 
     if mode == 'od_points':
         max_points = int(form['max_points'])
@@ -652,6 +644,22 @@ def _build_map(form):
             raise ValueError('请至少输入一个车辆 ID')
         speed_factor = int(form['speed_factor'])
         return create_animated_trajectory(vehicle_ids, form['start_time'], form['end_time'], speed_factor=speed_factor)
+
+    if mode == 'road_correction':
+        vehicle_ids = [int(item.strip()) for item in form['vehicle_id'].split(',') if item.strip()]
+        if not vehicle_ids:
+            raise ValueError('请至少输入一个车辆 ID')
+        if len(vehicle_ids) > 3:
+            raise ValueError('路网校正样例最多支持 3 辆车')
+        enable_correction = form.get('enable_correction', True)
+        use_undirected = form.get('use_undirected', False)
+        return plot_corrected_trajectory(
+            vehicle_ids,
+            form['start_time'],
+            form['end_time'],
+            enable_correction=enable_correction,
+            use_undirected=use_undirected,
+        )
 
     if mode == 'point_picker':
         return create_point_picker_map()
@@ -706,11 +714,10 @@ def index():
             'end_time': request.form.get('end_time', form['end_time']).strip(),
             'snapshot_time': request.form.get('snapshot_time', form['snapshot_time']).strip(),
             'max_vehicles': request.form.get('max_vehicles', form['max_vehicles']).strip(),
-            'id_min': request.form.get('id_min', '').strip(),
-            'id_max': request.form.get('id_max', '').strip(),
-            'status_filter': request.form.get('status_filter', '').strip(),
             'max_points': request.form.get('max_points', form['max_points']).strip(),
             'speed_factor': request.form.get('speed_factor', form['speed_factor']).strip(),
+            'enable_correction': request.form.get('enable_correction') == '1',
+            'use_undirected': request.form.get('use_undirected') == '1',
         })
 
         try:

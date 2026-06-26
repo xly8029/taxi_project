@@ -268,6 +268,28 @@ def bearing_angle(lng1, lat1, lng2, lat2) -> np.ndarray:
     return (brng + 360) % 360
 
 
+def add_point_heading(df: pd.DataFrame) -> pd.DataFrame:
+    """为清洗后的逐点轨迹补充方向角_HEAD，供缓存/HMM直接复用。"""
+    df = df.sort_values(by=['id', 'time']).reset_index(drop=True).copy()
+
+    next_id = df['id'].shift(-1)
+    next_lng = df['long'].shift(-1)
+    next_lat = df['lati'].shift(-1)
+    same_vehicle_next = df['id'] == next_id
+
+    df['方向角_HEAD'] = np.nan
+    df.loc[same_vehicle_next, '方向角_HEAD'] = bearing_angle(
+        df.loc[same_vehicle_next, 'long'],
+        df.loc[same_vehicle_next, 'lati'],
+        next_lng.loc[same_vehicle_next],
+        next_lat.loc[same_vehicle_next],
+    )
+
+    # 车辆最后一个点没有后继点，回填上一条方向角，避免末点丢失方向信息。
+    df['方向角_HEAD'] = df.groupby('id')['方向角_HEAD'].ffill().bfill().round(1)
+    return df
+
+
 # --------------------------- 7. OD（出行信息表）提取（需求11，02阶段任务） ---------------------------
 def extract_od(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -358,6 +380,7 @@ def main():
     n_before_abn = df.shape[0]
     df = remove_abnormal_status(df)           # 需求8-10：短时间状态突变异常清洗
     n_after_abn = df.shape[0]
+    df = add_point_heading(df)
 
     os.makedirs(os.path.dirname(CLEAN_DATA_PATH), exist_ok=True)
     df.to_csv(CLEAN_DATA_PATH, index=False, encoding="utf-8-sig")
