@@ -547,12 +547,16 @@ def _build_trajectory_lookup_js(map_js_name):
             lookupTimer = setTimeout(function() {{ animateLookupStep(points, vehicleId); }}, delay);
         }}
 
-        window.queryVehicleTrajectoryAfter = function(vehicleId, afterTimeStr) {{
-            if (!window.confirm('是否查看车辆 ' + vehicleId + ' 在此刻之后的轨迹？')) {{
+        window.queryVehicleTrajectoryAfter = function(vehicleId, afterTimeStr, endTimeStr) {{
+            if (!window.confirm('是否查看车辆 ' + vehicleId + ' 的轨迹？')) {{
                 return;
             }}
-            fetch('/api/vehicle_trajectory?vehicle_id=' + encodeURIComponent(vehicleId)
-                  + '&start_time=' + encodeURIComponent(afterTimeStr))
+            var url = '/api/vehicle_trajectory?vehicle_id=' + encodeURIComponent(vehicleId)
+                    + '&start_time=' + encodeURIComponent(afterTimeStr);
+            if (endTimeStr) {{
+                url += '&end_time=' + encodeURIComponent(endTimeStr);
+            }}
+            fetch(url)
                 .then(function(resp) {{ return resp.json(); }})
                 .then(function(data) {{
                     if (data.error) {{
@@ -640,19 +644,26 @@ def plot_minute_snapshot(time_str, vehicle_ids=None, max_vehicles=500,
 
         if enable_trajectory_lookup:
             # popup里加一个按钮，点击后触发"弹窗确认+当前页面画后续轨迹"的JS逻辑
+            default_end = pd.to_datetime(time_str_iso) + pd.Timedelta(hours=2)
+            default_end_str = default_end.strftime('%Y-%m-%d %H:%M:%S')
             popup_html = f"""
             <div style="font-size:13px;line-height:1.7;">
               车辆ID: {vehicle_id}<br>
               状态: {status_text}<br>
               速度: {row['speed']}km/h<br>
-              <button onclick="window.queryVehicleTrajectoryAfter({vehicle_id}, '{time_str_iso}')"
-                      style="margin-top:6px;padding:4px 12px;border:0;border-radius:6px;
-                             background:#0f6cbd;color:#fff;cursor:pointer;">
+              <div style="margin-top:4px;">
+                <label style="font-size:11px;color:#637487;">截止时间</label>
+                <input id="end-time-{vehicle_id}" type="text" value="{default_end_str}"
+                       style="width:100%;padding:4px 6px;border:1px solid #d7e0ea;border-radius:6px;font-size:12px;box-sizing:border-box;">
+              </div>
+              <button onclick="window.queryVehicleTrajectoryAfter({vehicle_id}, '{time_str_iso}', document.getElementById('end-time-{vehicle_id}').value)"
+                      style="margin-top:4px;padding:4px 12px;border:0;border-radius:6px;
+                             background:#0f6cbd;color:#fff;cursor:pointer;width:100%;">
                 查看后续轨迹
               </button>
             </div>
             """
-            popup = folium.Popup(popup_html, max_width=220)
+            popup = folium.Popup(popup_html, max_width=240)
         else:
             popup = f"车辆ID: {vehicle_id}<br>状态: {status_text}<br>速度: {row['speed']}km/h"
 

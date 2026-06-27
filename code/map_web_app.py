@@ -788,21 +788,23 @@ def serve_analysis_map(filename):
 @app.route('/api/vehicle_trajectory')
 def api_vehicle_trajectory():
     """
-    API 端点：返回指定车辆从给定时间点开始的后续轨迹数据（JSON 格式）。
+    API 端点：返回指定车辆在时间范围内的轨迹数据（JSON 格式）。
     供分钟快照地图中的"查看后续轨迹"功能使用。
 
     Query params:
         vehicle_id: 车辆 ID（整数）
         start_time: 起始时间（字符串，如 "2013-10-22 08:00:00"）
+        end_time: 截止时间（可选，留空返回从 start_time 到末尾的数据）
     """
     try:
         vehicle_id = int(request.args.get('vehicle_id', ''))
         start_time = request.args.get('start_time', '').strip()
+        end_time = request.args.get('end_time', '').strip() or None
         if not start_time:
             return jsonify({'error': '缺少 start_time 参数'})
 
         from map_visualization import load_vehicle_trajectory
-        df = load_vehicle_trajectory(vehicle_id, start_time=start_time)
+        df = load_vehicle_trajectory(vehicle_id, start_time=start_time, end_time=end_time)
 
         if df.empty:
             return jsonify({'error': f'车辆 {vehicle_id} 在该时间点之后无数据'})

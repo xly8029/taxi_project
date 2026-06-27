@@ -47,11 +47,11 @@ TRIP_MIDDLE_KM = 8
 DBSCAN_EPS_DEG = 0.005
 DBSCAN_MIN_SAMPLES = 8
 HEATMAP_GRADIENT = {
-    0.05: '#2b83ba',
-    0.20: '#abdda4',
-    0.45: '#ffffbf',
-    0.70: '#fdae61',
-    1.00: '#d7191c',
+    0.2:  '#0000ff',   # 蓝色 —— 低聚集
+    0.5:  '#00ff00',   # 绿色 —— 中低聚集
+    0.75: '#ffff00',   # 黄色 —— 中高聚集
+    0.9:  '#ff8000',   # 橙色 —— 高聚集
+    1.0:  '#ff0000',   # 红色 —— 最高聚集
 }
 # ==========================================================
 
@@ -78,8 +78,7 @@ def create_base_map(title: str):
     return m
 
 
-def scale_heat_weight(series: pd.Series, lower_percentile: float = 20) -> pd.Series:
-    """基于百分位数裁剪的热力权重缩放，避免低密度区域被固定阈值不合理抬高。"""
+def scale_heat_weight(series: pd.Series, lower_percentile: float = 5) -> pd.Series:
     max_weight = series.max()
     if max_weight <= 0:
         return pd.Series([0.05] * len(series), index=series.index)
@@ -94,7 +93,7 @@ def scale_heat_weight(series: pd.Series, lower_percentile: float = 20) -> pd.Ser
     else:
         return pd.Series([0.5] * len(series), index=series.index)
 
-    normalized = normalized ** 2
+    # 去掉 ** 2，改用线性，让低密度点落到蓝色区间
     return 0.05 + 0.95 * normalized
 
 
@@ -326,7 +325,7 @@ def build_custom_dynamic_heatmap_html(title: str, data, time_labels, output_path
     const timeLabels = {json.dumps(time_labels, ensure_ascii=False)};
     const map = L.map('map').setView([{SHENZHEN_CENTER[0]}, {SHENZHEN_CENTER[1]}], 11);
     L.tileLayer('https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{ maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }}).addTo(map);
-    let heatLayer = L.heatLayer([], {{ radius: 12, blur: 10, maxZoom: 16, minOpacity: 0.25, gradient: {{0.05:'#2b83ba',0.2:'#abdda4',0.45:'#ffffbf',0.7:'#fdae61',1.0:'#d7191c'}} }}).addTo(map);
+    let heatLayer = L.heatLayer([], {{ radius: 12, blur: 10, maxZoom: 16, minOpacity: 0.25, gradient: {{0.2:'#0000ff', 0.5:'#00ff00', 0.75:'#ffff00', 0.9:'#ff8000', 1.0:'#ff0000'}} }}).addTo(map);
     let timer = null;
     let currentIndex = 0;
 
