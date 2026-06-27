@@ -41,13 +41,17 @@ MAX_SNAP_DISTANCE_METERS = 80
 # 如果路网路径相对 GPS 直线距离绕行过大，则拒绝该段校正
 MAX_ROUTE_DETOUR_RATIO = 4.0
 MAX_ROUTE_EXTRA_METERS = 500
-MAX_CANDIDATE_SEARCH_METERS = 120
-MAX_CANDIDATES_PER_POINT = 5
+# 候选搜索半径与候选数适度放宽：深圳主辅路/立交并行路段较多，过窄的
+# 搜索范围或过少的候选数容易让真正应匹配的道路漏出候选集之外。
+MAX_CANDIDATE_SEARCH_METERS = 150
+MAX_CANDIDATES_PER_POINT = 8
 MAX_SEGMENT_TIME_GAP_SECONDS = 90
 MAX_SEGMENT_SPEED_MPS = 35
 EMISSION_SIGMA_METERS = 20
 TRANSITION_BETA_METERS = 50
-MAX_DIRECTION_DIFF_DEGREES = 75
+# 方向容差适度收紧：75度过于宽松，容易让方向上明显不对的候选边
+# （比如垂直路口处的横向道路）混入同等竞争，导致吸附到错误道路。
+MAX_DIRECTION_DIFF_DEGREES = 55
 REVERSE_DIRECTION_PENALTY = 120
 MIN_HEADING_SPEED_KMH = 5
 MIN_HEADING_DISTANCE_METERS = 20
@@ -313,17 +317,30 @@ def _snap_gps_point_to_edge(G, G_projected, lat, lng, edge=None):
     snap_distance_m = point.distance(snapped_point)
     edge_length_m = max(geometry.length, 1e-6)
     snapped_lng, snapped_lat = to_latlon.transform(snapped_point.x, snapped_point.y)
-    edge_start = geometry.interpolate(max(offset - 5, 0))
-    edge_end = geometry.interpolate(min(offset + 5, geometry.length))
+
+    # 局部切线方向：采样窗口按边长自适应（边长的10%，且夹在2米~15米之间），
+    # 避免固定5米窗口在很短的边上把首尾两个采样点压成几乎同一个点（导致
+    # bearing 噪声很大），也避免在长直道上窗口过小放大 GPS/几何抖动误差。
+    half_window = max(2.0, min(15.0, edge_length_m * 0.1))
+    edge_start = geometry.interpolate(max(offset - half_window, 0))
+    edge_end = geometry.interpolate(min(offset + half_window, geometry.length))
+    if edge_start.distance(edge_end) < 1e-6:
+        # 仍然退化（极短边或吸附点恰好在端点），直接用整条边的首尾点。
+        edge_start = geometry.interpolate(0)
+        edge_end = geometry.interpolate(geometry.length)
     edge_start_lng, edge_start_lat = to_latlon.transform(edge_start.x, edge_start.y)
     edge_end_lng, edge_end_lat = to_latlon.transform(edge_end.x, edge_end.y)
     edge_bearing = _bearing_degrees(edge_start_lat, edge_start_lng, edge_end_lat, edge_end_lng)
 
     edge_data = G.get_edge_data(u, v, key) or {}
     oneway = bool(edge_data.get("oneway", False))
+    osmid = edge_data.get("osmid")
+    if isinstance(osmid, (list, tuple)):
+        osmid = frozenset(osmid)
 
     return {
         "edge": (u, v, key),
+        "osmid": osmid,
         "snapped": [snapped_lat, snapped_lng],
         "snap_distance_m": snap_distance_m,
         "distance_to_u_m": offset,
@@ -404,26 +421,140 @@ def _build_candidate_sets(G, G_projected, edges_projected, lats, lngs,
     ]
 
 
+LINK_HIGHWAY_TYPES = {
+    "motorway_link", "trunk_link", "primary_link",
+    "secondary_link", "tertiary_link",
+}
+
+# 匝道/环形道路天然弧长远大于弦长，绕行比例和绕行余量都应放宽，
+# 否则真实的弯道路径会被系统性地判定为"绕行过大"而拒绝。
+RAMP_DETOUR_RATIO_MULTIPLIER = 2.5
+RAMP_DETOUR_EXTRA_MULTIPLIER = 2.5
+
+# 同一条 OSM 道路（osmid）连续匹配时给予的转移代价折扣，抑制在立交处
+# 因为候选边密集、方向相近而在相邻匝道之间反复跳变。
+SAME_ROAD_CONTINUITY_BONUS = 15
+
+
+def _edge_highway_type(G, u, v, key):
+    """返回边的 highway 标签（osmnx 里可能是字符串或列表，取首个）。"""
+    edge_data = G.get_edge_data(u, v, key) or {}
+    highway = edge_data.get("highway")
+    if isinstance(highway, (list, tuple)):
+        return highway[0] if highway else None
+    return highway
+
+
+def _edge_osmid(G, u, v, key):
+    """返回边的 osmid（可能是单值或列表），用于判断是否为同一条道路的延续。"""
+    edge_data = G.get_edge_data(u, v, key) or {}
+    osmid = edge_data.get("osmid")
+    if isinstance(osmid, (list, tuple)):
+        return frozenset(osmid)
+    return osmid
+
+
+def _path_ramp_ratio(G, path):
+    """路径中匝道类边（highway=*_link）的长度占比，用于放宽绕行判定。"""
+    if not path or len(path) < 2:
+        return 0.0
+    total_len = 0.0
+    ramp_len = 0.0
+    for u, v in zip(path[:-1], path[1:]):
+        edge_bundle = G.get_edge_data(u, v)
+        if not edge_bundle:
+            continue
+        best_key = min(edge_bundle, key=lambda item: edge_bundle[item].get("length", float("inf")))
+        edge_data = edge_bundle[best_key]
+        length = edge_data.get("length", 0.0) or 0.0
+        total_len += length
+        highway = edge_data.get("highway")
+        if isinstance(highway, (list, tuple)):
+            highway = highway[0] if highway else None
+        if highway in LINK_HIGHWAY_TYPES:
+            ramp_len += length
+    if total_len <= 0:
+        return 0.0
+    return ramp_len / total_len
+
+
+def _detour_threshold_m(gps_dist_m, ramp_ratio):
+    """
+    计算"判定为绕行过大"的距离阈值，按匝道占比放宽。
+
+    环形/匝道道路的弧长本来就远大于两点间弦长（gps_dist_m），这是道路
+    几何的固有特性，不是匹配错误。若路径主要由匝道类道路构成
+    （ramp_ratio 接近1），按比例放宽 ratio 和 extra 两项余量；
+    普通道路（ramp_ratio=0）维持原有较严格的阈值，避免放过真正的
+    错误匹配。
+    """
+    ratio = MAX_ROUTE_DETOUR_RATIO * (1 + (RAMP_DETOUR_RATIO_MULTIPLIER - 1) * ramp_ratio)
+    extra = MAX_ROUTE_EXTRA_METERS * (1 + (RAMP_DETOUR_EXTRA_MULTIPLIER - 1) * ramp_ratio)
+    return max(gps_dist_m * ratio, gps_dist_m + extra)
+
+
 def _choose_best_route(G_directed, G_undirected, prev_snap, curr_snap, use_undirected=False):
-    """在边端点组合中选择总代价最小的路网路径。"""
-    candidates = []
-    prev_nodes = [
-        (prev_snap["edge"][0], prev_snap["distance_to_u_m"]),
-        (prev_snap["edge"][1], prev_snap["distance_to_v_m"]),
-    ]
-    curr_nodes = [
-        (curr_snap["edge"][0], curr_snap["distance_to_u_m"]),
-        (curr_snap["edge"][1], curr_snap["distance_to_v_m"]),
-    ]
+    """
+    在边端点组合中选择总代价最小的路网路径。
+
+    关键修正：
+    1. 同一条边内部移动（prev/curr 吸附到同一条边）必须走"沿边推进"，
+       不能退化成端点间的最短路径搜索——否则在有向图上会被允许从 v 端
+       重新出发，产生不存在的转向/绕路。
+    2. 在有向图上，一条有向边 u->v 只能从 v 继续向外走（如果车辆正沿
+       该边方向行驶），不能把 u 也当作"下一段路径的起点"，否则等于
+       允许车辆瞬间穿越/逆行回到边的入口去找近路。只有在该边非单行时
+       才把 u 也纳入候选起点。
+    """
+    # 情形 1：两点吸附在同一条边上，直接按边上的先后顺序处理，不做图搜索。
+    if prev_snap["edge"] == curr_snap["edge"]:
+        if curr_snap["distance_to_u_m"] >= prev_snap["distance_to_u_m"]:
+            same_edge_len = abs(curr_snap["distance_to_u_m"] - prev_snap["distance_to_u_m"])
+            u, v, key = prev_snap["edge"]
+            highway = _edge_highway_type(G_directed, u, v, key)
+            return {
+                "path": [u, v],
+                "graph_used": "same_edge",
+                "route_length_m": same_edge_len,
+                "total_cost_m": same_edge_len,
+                "ramp_ratio": 1.0 if highway in LINK_HIGHWAY_TYPES else 0.0,
+            }
 
     primary_graph = G_undirected if use_undirected else G_directed
     graph_choices = [(primary_graph, "directed" if not use_undirected else "undirected")]
     if not use_undirected:
         graph_choices.append((G_undirected, "undirected_fallback"))
 
-    for start_node, start_cost in prev_nodes:
-        for end_node, end_cost in curr_nodes:
-            for graph, graph_used in graph_choices:
+    candidates = []
+    for graph, graph_used in graph_choices:
+        is_directed_pass = graph_used == "directed"
+
+        if is_directed_pass:
+            # 有向图上，只允许从"沿边方向上的下一个节点"出发：
+            # 若该边非单行，u/v 都可作为合法的离开点；若单行，只能从 v 出发。
+            prev_nodes = [(prev_snap["edge"][1], prev_snap["distance_to_v_m"])]
+            if not prev_snap.get("oneway", False):
+                prev_nodes.append((prev_snap["edge"][0], prev_snap["distance_to_u_m"]))
+
+            # 到达 curr 边时，若非单行，可以从 u 或 v 任一端进入；
+            # 若单行，只能从 u 端进入（沿边方向行驶到吸附点之前）。
+            curr_nodes = [(curr_snap["edge"][0], curr_snap["distance_to_u_m"])]
+            if not curr_snap.get("oneway", False):
+                curr_nodes.append((curr_snap["edge"][1], curr_snap["distance_to_v_m"]))
+        else:
+            # 无向图/兜底场景不存在方向限制，两端都可尝试。
+            prev_nodes = [
+                (prev_snap["edge"][0], prev_snap["distance_to_u_m"]),
+                (prev_snap["edge"][1], prev_snap["distance_to_v_m"]),
+            ]
+            curr_nodes = [
+                (curr_snap["edge"][0], curr_snap["distance_to_u_m"]),
+                (curr_snap["edge"][1], curr_snap["distance_to_v_m"]),
+            ]
+
+        found_in_this_graph = False
+        for start_node, start_cost in prev_nodes:
+            for end_node, end_cost in curr_nodes:
                 try:
                     route_length = nx.shortest_path_length(graph, start_node, end_node, weight="length")
                     route_path = nx.shortest_path(graph, start_node, end_node, weight="length")
@@ -432,10 +563,16 @@ def _choose_best_route(G_directed, G_undirected, prev_snap, curr_snap, use_undir
                         "graph_used": graph_used,
                         "route_length_m": route_length,
                         "total_cost_m": start_cost + route_length + end_cost,
+                        "ramp_ratio": _path_ramp_ratio(G_directed, route_path),
                     })
-                    break
+                    found_in_this_graph = True
                 except nx.NetworkXNoPath:
                     continue
+
+        # 只有在主图（有向图）完全找不到路径时才进入无向图兜底，
+        # 避免有向图里本来有解却被无向图"更短但违反方向"的路径抢走。
+        if found_in_this_graph:
+            break
 
     if not candidates:
         return None
@@ -444,7 +581,18 @@ def _choose_best_route(G_directed, G_undirected, prev_snap, curr_snap, use_undir
 
 def _viterbi_match_candidates(candidate_sets, movement_bearings, lats, lngs, G_directed, G_undirected,
                               use_undirected=False, max_snap_distance_m=MAX_SNAP_DISTANCE_METERS):
-    """使用 HMM/Viterbi 在多候选边之间选择全局最优序列。"""
+    """
+    使用 HMM/Viterbi 在多候选边之间选择全局最优序列。
+
+    关键修正：原实现一旦某一帧的所有候选都无法从上一帧任何候选转移过来
+    （dp_costs 整行变为 inf），后续每一帧的 backpointer 都会因为"上一帧
+    全 inf"而继续传播 None，最终整条轨迹被判定为匹配失败，退回到完全不
+    做方向/转移约束的粗糙最近边吸附——哪怕断点只发生在中间一个点。
+    现在改为：当某一帧整行变为 inf 时，该帧"重新起跳"，只用当帧自身的
+    发射概率作为代价（允许从这一帧重新开始一条新的匹配链），并记录该帧
+    与前一帧的连接断裂，但不影响断点之外的其它点继续做完整的方向/转移
+    约束匹配。
+    """
     route_cache = {}
     emissions = []
     for candidates in candidate_sets:
@@ -459,12 +607,15 @@ def _viterbi_match_candidates(candidate_sets, movement_bearings, lats, lngs, G_d
 
     dp_costs = [emissions[0][:]]
     backpointers = [[None] * len(candidate_sets[0])]
+    restart_flags = [all(cost == float("inf") for cost in dp_costs[0])]
 
     for i in range(1, len(candidate_sets)):
         gps_dist = _haversine_meters(lats[i - 1], lngs[i - 1], lats[i], lngs[i])
         gps_bearing = movement_bearings[i - 1]
         row_costs = [float("inf")] * len(candidate_sets[i])
         row_back = [None] * len(candidate_sets[i])
+
+        prev_row_all_inf = all(cost == float("inf") for cost in dp_costs[i - 1])
 
         for curr_idx, curr_cand in enumerate(candidate_sets[i]):
             if emissions[i][curr_idx] == float("inf"):
@@ -484,10 +635,22 @@ def _viterbi_match_candidates(candidate_sets, movement_bearings, lats, lngs, G_d
 
                 route_cost = route["total_cost_m"]
                 detour = abs(route_cost - gps_dist)
-                if route_cost > max(gps_dist * MAX_ROUTE_DETOUR_RATIO, gps_dist + MAX_ROUTE_EXTRA_METERS):
+                ramp_ratio = route.get("ramp_ratio", 0.0)
+                if route_cost > _detour_threshold_m(gps_dist, ramp_ratio):
                     continue
 
                 transition_cost = 0.5 * (detour / TRANSITION_BETA_METERS) ** 2 + math.log(TRANSITION_BETA_METERS)
+
+                # 同路连续性奖励：若 prev/curr 吸附到同一条 OSM 道路
+                # （osmid 相同，含同一道路被拆成多段 edge 的情况），说明
+                # 车辆很可能一直沿着这条路行驶，给予代价折扣；这能在立交
+                # 处候选边密集、彼此距离相近时，抑制 Viterbi 在不同匝道
+                # 间反复跳变所导致的锯齿状轨迹。
+                prev_osmid = prev_cand.get("osmid")
+                curr_osmid = curr_cand.get("osmid")
+                if prev_osmid is not None and prev_osmid == curr_osmid:
+                    transition_cost = max(transition_cost - SAME_ROAD_CONTINUITY_BONUS, 0.0)
+
                 if gps_bearing is not None:
                     curr_dir_diff = _angle_diff_degrees(gps_bearing, curr_cand["edge_bearing"])
                     prev_dir_diff = _angle_diff_degrees(gps_bearing, prev_cand["edge_bearing"])
@@ -495,12 +658,31 @@ def _viterbi_match_candidates(candidate_sets, movement_bearings, lats, lngs, G_d
                         continue
                     if prev_cand["oneway"] and prev_dir_diff > MAX_DIRECTION_DIFF_DEGREES:
                         continue
+                    # 非单行道不再硬性拒绝，但仍应让方向不一致的候选在
+                    # 竞争中付出代价——否则在双向路/辅路并行处，路网距离
+                    # 略短就足以让 Viterbi 选中方向完全拧反的边。
+                    dir_penalty = (
+                        (curr_dir_diff / 180.0) ** 2 + (prev_dir_diff / 180.0) ** 2
+                    ) * REVERSE_DIRECTION_PENALTY
+                    transition_cost += dir_penalty
                 if route["graph_used"] == "undirected_fallback":
                     continue
                 total_cost = dp_costs[i - 1][prev_idx] + transition_cost + emissions[i][curr_idx]
                 if total_cost < row_costs[curr_idx]:
                     row_costs[curr_idx] = total_cost
                     row_back[curr_idx] = prev_idx
+
+        row_all_inf = all(cost == float("inf") for cost in row_costs)
+        if row_all_inf and not prev_row_all_inf:
+            # 本帧与上一帧之间彻底连不通（很可能是 GPS 噪声导致的临时
+            # 候选不匹配）。不让整条链就此终止：以当帧自身发射概率重新
+            # 起跳，相当于在这里截断一条新的匹配子链，断点之外的点仍可
+            # 正常参与完整的方向/转移约束匹配。
+            row_costs = emissions[i][:]
+            row_back = [None] * len(candidate_sets[i])
+            restart_flags.append(True)
+        else:
+            restart_flags.append(False)
 
         dp_costs.append(row_costs)
         backpointers.append(row_back)
@@ -512,11 +694,33 @@ def _viterbi_match_candidates(candidate_sets, movement_bearings, lats, lngs, G_d
     last_idx = min(range(len(last_row)), key=lambda idx: last_row[idx])
     path_indices = [last_idx]
     for i in range(len(candidate_sets) - 1, 0, -1):
+        if restart_flags[i]:
+            # 该帧是重新起跳点，没有可回溯的上一帧链接，
+            # 直接沿用同一帧索引向前结束回溯（链条在此截断）。
+            break
         prev_idx = backpointers[i][path_indices[-1]]
         if prev_idx is None:
             return None, route_cache
         path_indices.append(prev_idx)
     path_indices.reverse()
+
+    # 因为存在"重新起跳"截断，path_indices 可能比 candidate_sets 短；
+    # 对于截断点之前的帧，直接用该帧候选里发射概率最高（snap_distance_m
+    # 最小）的候选兜底，保证每一帧都有输出，不丢点。
+    if len(path_indices) < len(candidate_sets):
+        filled = [None] * len(candidate_sets)
+        offset = len(candidate_sets) - len(path_indices)
+        for j, idx in enumerate(path_indices):
+            filled[offset + j] = idx
+        for j in range(offset):
+            candidates = candidate_sets[j]
+            best_idx = min(
+                range(len(candidates)),
+                key=lambda k: candidates[k]["snap_distance_m"],
+            )
+            filled[j] = best_idx
+        path_indices = filled
+
     selected = [candidate_sets[i][cand_idx] for i, cand_idx in enumerate(path_indices)]
     return {"selected": selected, "path_indices": path_indices}, route_cache
 
@@ -702,12 +906,12 @@ def correct_trajectory(df, G=None, use_undirected=False,
             if same_edge:
                 curr_dir_diff = _angle_diff_degrees(gps_bearing, curr_snap["edge_bearing"]) if gps_bearing is not None else None
                 if curr_snap["oneway"] and curr_dir_diff is not None and curr_dir_diff > MAX_DIRECTION_DIFF_DEGREES:
-                    _append_coord(corrected, [lat_curr, lng_curr])
+                    _append_coord(corrected, curr_snap["snapped"])
                     stats["rejected_segments"] += 1
                     debug_segments.append({
                         "type": "direction_warning",
                         "coords": [[lat_prev, lng_prev], [lat_curr, lng_curr]],
-                        "message": f"片段{seg_index} 段{i}: 同边但单行方向冲突({curr_dir_diff:.0f}°)，回退原始GPS",
+                        "message": f"片段{seg_index} 段{i}: 同边但单行方向冲突({curr_dir_diff:.0f}°)，回退吸附点",
                     })
                     continue
                 _append_coord(corrected, curr_snap["snapped"])
@@ -722,7 +926,7 @@ def correct_trajectory(df, G=None, use_undirected=False,
             if route is None:
                 route = _choose_best_route(G_directed, G_undirected, prev_snap, curr_snap, use_undirected=use_undirected)
             if route is None:
-                _append_coord(corrected, [lat_curr, lng_curr])
+                _append_coord(corrected, curr_snap["snapped"])
                 stats["failed_segments"] += 1
                 failure = {
                     "segment_index": i,
@@ -745,13 +949,14 @@ def correct_trajectory(df, G=None, use_undirected=False,
                 )
                 continue
 
-            if route["total_cost_m"] > max(dist_m * MAX_ROUTE_DETOUR_RATIO, dist_m + MAX_ROUTE_EXTRA_METERS):
-                _append_coord(corrected, [lat_curr, lng_curr])
+            route_ramp_ratio = route.get("ramp_ratio", 0.0)
+            if route["total_cost_m"] > _detour_threshold_m(dist_m, route_ramp_ratio):
+                _append_coord(corrected, curr_snap["snapped"])
                 stats["rejected_segments"] += 1
                 debug_segments.append({
                     "type": "detour",
                     "coords": [[lat_prev, lng_prev], [lat_curr, lng_curr]],
-                    "message": f"片段{seg_index} 段{i}: 绕行过大，回退原始GPS",
+                    "message": f"片段{seg_index} 段{i}: 绕行过大，回退吸附点",
                 })
                 logger.warning(
                     "片段 %d 段 %d 绕行过大(路网=%.0fm, GPS=%.0fm)，拒绝校正 | (%f,%f)->(%f,%f)",
@@ -760,13 +965,13 @@ def correct_trajectory(df, G=None, use_undirected=False,
                 continue
 
             if route["graph_used"] == "undirected_fallback":
-                _append_coord(corrected, [lat_curr, lng_curr])
+                _append_coord(corrected, curr_snap["snapped"])
                 stats["undirected_fallback"] += 1
                 stats["rejected_segments"] += 1
                 debug_segments.append({
                     "type": "undirected_fallback",
                     "coords": [[lat_prev, lng_prev], [lat_curr, lng_curr]],
-                    "message": f"片段{seg_index} 段{i}: 仅无向图可达，回退原始GPS",
+                    "message": f"片段{seg_index} 段{i}: 仅无向图可达，回退吸附点",
                 })
                 continue
 
@@ -776,12 +981,12 @@ def correct_trajectory(df, G=None, use_undirected=False,
                 (prev_snap["oneway"] and prev_dir_diff > MAX_DIRECTION_DIFF_DEGREES) or
                 (curr_snap["oneway"] and curr_dir_diff > MAX_DIRECTION_DIFF_DEGREES)
             ):
-                _append_coord(corrected, [lat_curr, lng_curr])
+                _append_coord(corrected, curr_snap["snapped"])
                 stats["rejected_segments"] += 1
                 debug_segments.append({
                     "type": "direction_warning",
                     "coords": [[lat_prev, lng_prev], [lat_curr, lng_curr]],
-                    "message": f"片段{seg_index} 段{i}: 单行方向冲突(prev={prev_dir_diff:.0f}°, curr={curr_dir_diff:.0f}°)，回退原始GPS",
+                    "message": f"片段{seg_index} 段{i}: 单行方向冲突(prev={prev_dir_diff:.0f}°, curr={curr_dir_diff:.0f}°)，回退吸附点",
                 })
                 continue
 
