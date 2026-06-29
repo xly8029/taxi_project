@@ -8,6 +8,7 @@
 import os
 import uuid
 
+import pandas as pd
 from flask import Flask, request, render_template_string, send_from_directory, jsonify
 
 from data_analysis import (
@@ -281,6 +282,22 @@ PAGE_TEMPLATE = """
             <label for="snapshot_time">快照时间</label>
             <input id="snapshot_time" name="snapshot_time" value="{{ form.snapshot_time }}" placeholder="2013-10-22 08:00">
           </div>
+          <div class="field">
+            <label for="snapshot_vehicle_id_min">车辆 ID 下限</label>
+            <input id="snapshot_vehicle_id_min" name="snapshot_vehicle_id_min" value="{{ form.snapshot_vehicle_id_min }}" placeholder="例如 20000，可为空">
+          </div>
+          <div class="field">
+            <label for="snapshot_vehicle_id_max">车辆 ID 上限</label>
+            <input id="snapshot_vehicle_id_max" name="snapshot_vehicle_id_max" value="{{ form.snapshot_vehicle_id_max }}" placeholder="例如 30000，可为空">
+          </div>
+          <div class="field">
+            <label for="snapshot_status_filter">载客状态</label>
+            <select id="snapshot_status_filter" name="snapshot_status_filter">
+              <option value="" {% if form.snapshot_status_filter == '' %}selected{% endif %}>全部</option>
+              <option value="1" {% if form.snapshot_status_filter == '1' %}selected{% endif %}>仅载客</option>
+              <option value="0" {% if form.snapshot_status_filter == '0' %}selected{% endif %}>仅空载</option>
+            </select>
+          </div>
         </div>
 
         <div id="max-vehicles-section">
@@ -331,7 +348,7 @@ PAGE_TEMPLATE = """
         <h2>填写说明</h2>
         <div>车辆轨迹/动画轨迹：需要填 `车辆 ID`、`开始时间`、`结束时间`。</div>
         <div>两种模式均支持多辆车，使用英文逗号分隔，例如 `22223,22224,22225`。</div>
-        <div>分钟位置快照：需要填 `快照时间`，格式 `2013-10-22 08:00`。</div>
+        <div>分钟位置快照：需要填 `快照时间`，可选筛选车辆 ID 下限/上限和载客状态，点击车辆可查看指定结束时间内的后续轨迹。</div>
         <div>上下车点分布：填写时间范围，系统从 OD 缓存中抽样展示。</div>
         <div>路网校正轨迹：填 1-3 辆车 ID 和短时间窗口，建议 ≤30 分钟。支持直接在地图上点选坐标。</div>
       </div>
@@ -599,6 +616,9 @@ def _default_form():
         'start_time': '2013-10-22 08:00:00',
         'end_time': '2013-10-22 10:00:00',
         'snapshot_time': '2013-10-22 08:00',
+        'snapshot_vehicle_id_min': '',
+        'snapshot_vehicle_id_max': '',
+        'snapshot_status_filter': '',
         'max_vehicles': '500',
         'max_points': '300',
         'speed_factor': '200',
@@ -630,7 +650,19 @@ def _build_map(form):
 
     if mode == 'snapshot':
         max_vehicles = int(form['max_vehicles'])
-        return plot_minute_snapshot(form['snapshot_time'], max_vehicles=max_vehicles)
+        snapshot_vehicle_id_min = form.get('snapshot_vehicle_id_min', '').strip()
+        snapshot_vehicle_id_max = form.get('snapshot_vehicle_id_max', '').strip()
+        snapshot_status_filter = form.get('snapshot_status_filter', '').strip()
+        id_min = int(snapshot_vehicle_id_min) if snapshot_vehicle_id_min else None
+        id_max = int(snapshot_vehicle_id_max) if snapshot_vehicle_id_max else None
+        status_filter = int(snapshot_status_filter) if snapshot_status_filter else None
+        return plot_minute_snapshot(
+            form['snapshot_time'],
+            max_vehicles=max_vehicles,
+            id_min=id_min,
+            id_max=id_max,
+            status_filter=status_filter,
+        )
 
     if mode == 'od_points':
         max_points = int(form['max_points'])
@@ -751,6 +783,9 @@ def index():
             'start_time': request.form.get('start_time', form['start_time']).strip(),
             'end_time': request.form.get('end_time', form['end_time']).strip(),
             'snapshot_time': request.form.get('snapshot_time', form['snapshot_time']).strip(),
+            'snapshot_vehicle_id_min': request.form.get('snapshot_vehicle_id_min', form['snapshot_vehicle_id_min']).strip(),
+            'snapshot_vehicle_id_max': request.form.get('snapshot_vehicle_id_max', form['snapshot_vehicle_id_max']).strip(),
+            'snapshot_status_filter': request.form.get('snapshot_status_filter', form['snapshot_status_filter']).strip(),
             'max_vehicles': request.form.get('max_vehicles', form['max_vehicles']).strip(),
             'max_points': request.form.get('max_points', form['max_points']).strip(),
             'speed_factor': request.form.get('speed_factor', form['speed_factor']).strip(),
@@ -832,15 +867,19 @@ def api_vehicle_trajectory():
     Query params:
         vehicle_id: 车辆 ID（整数）
         start_time: 起始时间（字符串，如 "2013-10-22 08:00:00"）
+        end_time: 结束时间（可选，字符串，如 "2013-10-22 08:30:00"）
     """
     try:
         vehicle_id = int(request.args.get('vehicle_id', ''))
         start_time = request.args.get('start_time', '').strip()
+        end_time = request.args.get('end_time', '').strip()
         if not start_time:
             return jsonify({'error': '缺少 start_time 参数'})
+        if end_time and pd.to_datetime(end_time) < pd.to_datetime(start_time):
+            return jsonify({'error': 'end_time 不能早于 start_time'})
 
         from map_visualization import load_vehicle_trajectory
-        df = load_vehicle_trajectory(vehicle_id, start_time=start_time)
+        df = load_vehicle_trajectory(vehicle_id, start_time=start_time, end_time=end_time or None)
 
         if df.empty:
             return jsonify({'error': f'车辆 {vehicle_id} 在该时间点之后无数据'})

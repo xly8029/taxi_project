@@ -452,6 +452,22 @@ def _build_trajectory_lookup_js(map_js_name):
             }}
         }});
 
+        function normalizeTimeInput(rawValue, fallbackTime) {{
+            var value = (rawValue || '').trim();
+            if (!value) return fallbackTime;
+            if (/^\\d{{4}}-\\d{{2}}-\\d{{2}} \\d{{2}}:\\d{{2}}$/.test(value)) return value + ':00';
+            return value.replace('T', ' ');
+        }}
+
+        function buildDefaultEndTime(startTimeStr) {{
+            var d = new Date(startTimeStr.replace(' ', 'T'));
+            if (isNaN(d.getTime())) return startTimeStr;
+            d.setMinutes(d.getMinutes() + 30);
+            var pad = function(n) {{ return n < 10 ? '0' + n : '' + n; }};
+            return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+                ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+        }}
+
         // 返回按钮：恢复全部车辆标记、地图视野，并清掉当前画的后续轨迹/动画
         document.addEventListener('click', function(e) {{
             if (e.target && e.target.id === 'traj-back-btn') {{
@@ -548,11 +564,18 @@ def _build_trajectory_lookup_js(map_js_name):
         }}
 
         window.queryVehicleTrajectoryAfter = function(vehicleId, afterTimeStr) {{
-            if (!window.confirm('是否查看车辆 ' + vehicleId + ' 在此刻之后的轨迹？')) {{
+            var defaultEndTime = buildDefaultEndTime(afterTimeStr);
+            var endTimeInput = window.prompt(
+                '请输入结束时间，留空则默认查询到该车后续全部轨迹。\\n格式示例：2013-10-22 08:30:00',
+                defaultEndTime
+            );
+            if (endTimeInput === null) {{
                 return;
             }}
+            var endTime = normalizeTimeInput(endTimeInput, '');
             fetch('/api/vehicle_trajectory?vehicle_id=' + encodeURIComponent(vehicleId)
-                  + '&start_time=' + encodeURIComponent(afterTimeStr))
+                  + '&start_time=' + encodeURIComponent(afterTimeStr)
+                  + '&end_time=' + encodeURIComponent(endTime))
                 .then(function(resp) {{ return resp.json(); }})
                 .then(function(data) {{
                     if (data.error) {{
@@ -1038,6 +1061,7 @@ def plot_corrected_trajectory(vehicle_ids, start_time=None, end_time=None,
             )
             orig = result["original_coords"]
             corr = result["corrected_coords"]
+            corr_segments = result.get("corrected_segments", [corr] if corr else [])
             debug_segments = result.get("debug_segments", [])
             s = result["stats"]
             rate = s["success_segments"] / max(s["total_segments"], 1) * 100
@@ -1053,10 +1077,11 @@ def plot_corrected_trajectory(vehicle_ids, start_time=None, end_time=None,
                 continue
             orig = df[["lati", "long"]].values.tolist()
             corr = orig
+            corr_segments = [orig] if orig else []
             debug_segments = []
 
         all_original.append((vehicle_id, orig))
-        all_corrected.append((vehicle_id, corr))
+        all_corrected.append((vehicle_id, corr, corr_segments))
         all_debug_segments.append((vehicle_id, debug_segments))
 
     if not all_original:
@@ -1090,14 +1115,17 @@ def plot_corrected_trajectory(vehicle_ids, start_time=None, end_time=None,
         ).add_to(original_group)
 
         if enable_correction:
-            corr = all_corrected[index][1]
-            folium.PolyLine(
-                corr,
-                color=COLOR_CORRECTED,
-                weight=5,
-                opacity=0.9,
-                popup=f"车辆 {vehicle_id} 校正轨迹",
-            ).add_to(corrected_group)
+            corr_segments = all_corrected[index][2]
+            for seg_idx, corr_segment in enumerate(corr_segments):
+                if len(corr_segment) < 2:
+                    continue
+                folium.PolyLine(
+                    corr_segment,
+                    color=COLOR_CORRECTED,
+                    weight=5,
+                    opacity=0.9,
+                    popup=f"车辆 {vehicle_id} 校正轨迹" if seg_idx == 0 else None,
+                ).add_to(corrected_group)
 
             folium.Marker(
                 orig[0],
