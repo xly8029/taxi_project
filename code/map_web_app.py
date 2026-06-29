@@ -255,7 +255,6 @@ PAGE_TEMPLATE = """
             <option value="od_points" {% if form.mode == 'od_points' %}selected{% endif %}>上下车点分布</option>
             <option value="animation" {% if form.mode == 'animation' %}selected{% endif %}>动画轨迹</option>
             <option value="road_correction" {% if form.mode == 'road_correction' %}selected{% endif %}>路网校正轨迹</option>
-            <option value="point_picker" {% if form.mode == 'point_picker' %}selected{% endif %}>地图选点工具</option>
           </select>
         </div>
 
@@ -334,8 +333,7 @@ PAGE_TEMPLATE = """
         <div>两种模式均支持多辆车，使用英文逗号分隔，例如 `22223,22224,22225`。</div>
         <div>分钟位置快照：需要填 `快照时间`，格式 `2013-10-22 08:00`。</div>
         <div>上下车点分布：填写时间范围，系统从 OD 缓存中抽样展示。</div>
-        <div>路网校正轨迹：填 1-3 辆车 ID 和短时间窗口，建议 ≤30 分钟。</div>
-        <div>地图选点工具：不需要填参数，打开后直接点击地图取点。</div>
+        <div>路网校正轨迹：填 1-3 辆车 ID 和短时间窗口，建议 ≤30 分钟。支持直接在地图上点选坐标。</div>
       </div>
     </aside>
 
@@ -653,16 +651,56 @@ def _build_map(form):
             raise ValueError('路网校正样例最多支持 3 辆车')
         enable_correction = form.get('enable_correction', True)
         use_undirected = form.get('use_undirected', False)
-        return plot_corrected_trajectory(
+        m = plot_corrected_trajectory(
             vehicle_ids,
             form['start_time'],
             form['end_time'],
             enable_correction=enable_correction,
             use_undirected=use_undirected,
         )
-
-    if mode == 'point_picker':
-        return create_point_picker_map()
+        # 将选点功能注入到校正轨迹地图中
+        map_js_name = m.get_name()
+        import folium as _folium
+        coord_panel = """
+        <div id="coord-panel" style="position:fixed; bottom:20px; right:20px; z-index:9999;
+                    background:rgba(255,255,255,0.92); border:2px solid #0f6cbd; border-radius:10px;
+                    padding:12px 16px; font-size:13px; min-width:200px; line-height:1.7;
+                    box-shadow: 0 4px 16px rgba(15, 108, 189, 0.15); pointer-events:auto;">
+            <div style="font-weight:bold; margin-bottom:4px;">📍 地图选点</div>
+            <div>纬度 (lat): <span id="pick-lat" style="color:#0f6cbd;">—</span></div>
+            <div>经度 (lng): <span id="pick-lng" style="color:#0f6cbd;">—</span></div>
+            <div style="margin-top:4px; font-size:12px; color:#637487;">点击地图任意位置更新坐标</div>
+        </div>
+        """
+        click_js = f"""
+        <script>
+        (function() {{
+            var currentMarker = null;
+            function bindPointPicker(map) {{
+                map.on('click', function(e) {{
+                    var lat = e.latlng.lat.toFixed(6);
+                    var lon = e.latlng.lng.toFixed(6);
+                    document.getElementById('pick-lat').textContent = lat;
+                    document.getElementById('pick-lng').textContent = lon;
+                    if (currentMarker) {{ map.removeLayer(currentMarker); }}
+                    currentMarker = L.marker([lat, lon]).addTo(map);
+                    currentMarker.bindPopup('纬度: ' + lat + '<br>经度: ' + lon).openPopup();
+                }});
+            }}
+            function waitForMap() {{
+                if (typeof {map_js_name} !== 'undefined' && {map_js_name}) {{
+                    bindPointPicker({map_js_name});
+                }} else {{
+                    setTimeout(waitForMap, 100);
+                }}
+            }}
+            waitForMap();
+        }})();
+        </script>
+        """
+        m.get_root().html.add_child(_folium.Element(coord_panel))
+        m.get_root().html.add_child(_folium.Element(click_js))
+        return m
 
     raise ValueError('不支持的查询模式')
 
@@ -788,23 +826,21 @@ def serve_analysis_map(filename):
 @app.route('/api/vehicle_trajectory')
 def api_vehicle_trajectory():
     """
-    API 端点：返回指定车辆在时间范围内的轨迹数据（JSON 格式）。
+    API 端点：返回指定车辆从给定时间点开始的后续轨迹数据（JSON 格式）。
     供分钟快照地图中的"查看后续轨迹"功能使用。
 
     Query params:
         vehicle_id: 车辆 ID（整数）
         start_time: 起始时间（字符串，如 "2013-10-22 08:00:00"）
-        end_time: 截止时间（可选，留空返回从 start_time 到末尾的数据）
     """
     try:
         vehicle_id = int(request.args.get('vehicle_id', ''))
         start_time = request.args.get('start_time', '').strip()
-        end_time = request.args.get('end_time', '').strip() or None
         if not start_time:
             return jsonify({'error': '缺少 start_time 参数'})
 
         from map_visualization import load_vehicle_trajectory
-        df = load_vehicle_trajectory(vehicle_id, start_time=start_time, end_time=end_time)
+        df = load_vehicle_trajectory(vehicle_id, start_time=start_time)
 
         if df.empty:
             return jsonify({'error': f'车辆 {vehicle_id} 在该时间点之后无数据'})

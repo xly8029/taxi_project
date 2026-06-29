@@ -40,7 +40,7 @@ MAX_SNAP_DISTANCE_METERS = 80
 
 # 如果路网路径相对 GPS 直线距离绕行过大，则拒绝该段校正
 MAX_ROUTE_DETOUR_RATIO = 4.0
-MAX_ROUTE_EXTRA_METERS = 800
+MAX_ROUTE_EXTRA_METERS = 500
 # 候选搜索半径与候选数适度放宽：深圳主辅路/立交并行路段较多，过窄的
 # 搜索范围或过少的候选数容易让真正应匹配的道路漏出候选集之外。
 MAX_CANDIDATE_SEARCH_METERS = 150
@@ -428,8 +428,8 @@ LINK_HIGHWAY_TYPES = {
 
 # 匝道/环形道路天然弧长远大于弦长，绕行比例和绕行余量都应放宽，
 # 否则真实的弯道路径会被系统性地判定为"绕行过大"而拒绝。
-RAMP_DETOUR_RATIO_MULTIPLIER = 4.0
-RAMP_DETOUR_EXTRA_MULTIPLIER = 4.0
+RAMP_DETOUR_RATIO_MULTIPLIER = 2.5
+RAMP_DETOUR_EXTRA_MULTIPLIER = 2.5
 
 # 同一条 OSM 道路（osmid）连续匹配时给予的转移代价折扣，抑制在立交处
 # 因为候选边密集、方向相近而在相邻匝道之间反复跳变。
@@ -490,10 +490,7 @@ def _detour_threshold_m(gps_dist_m, ramp_ratio):
     """
     ratio = MAX_ROUTE_DETOUR_RATIO * (1 + (RAMP_DETOUR_RATIO_MULTIPLIER - 1) * ramp_ratio)
     extra = MAX_ROUTE_EXTRA_METERS * (1 + (RAMP_DETOUR_EXTRA_MULTIPLIER - 1) * ramp_ratio)
-    # 保底阈值：短距离相邻GPS点之间走弯道时（如立交环道），弧长可达弦长8倍以上，
-    # 且至少允许300m的绝对路网长度，避免真实弯道被误判为绕行而退回直线。
-    floor_threshold = max(gps_dist_m * 8.0, 300.0)
-    return max(gps_dist_m * ratio, gps_dist_m + extra, floor_threshold)
+    return max(gps_dist_m * ratio, gps_dist_m + extra)
 
 
 def _choose_best_route(G_directed, G_undirected, prev_snap, curr_snap, use_undirected=False):
@@ -917,30 +914,7 @@ def correct_trajectory(df, G=None, use_undirected=False,
                         "message": f"片段{seg_index} 段{i}: 同边但单行方向冲突({curr_dir_diff:.0f}°)，回退吸附点",
                     })
                     continue
-                # 沿边几何插值：从 prev 吸附点到 curr 吸附点之间按边的真实几何采样，
-                # 而不是直接两点相连，避免弯道/匝道弧段变成直线。
-                u, v, key = prev_snap["edge"]
-                offset_prev = prev_snap["distance_to_u_m"]
-                offset_curr = curr_snap["distance_to_u_m"]
-                try:
-                    edge_geom = _edge_geometry(G_projected, u, v, key)
-                    to_latlon = _GRAPH_CACHE["to_latlon"]
-                    seg_len = abs(offset_curr - offset_prev)
-                    if seg_len > 1.0:
-                        n_interp = max(2, int(seg_len / 5))
-                        o_start = min(offset_prev, offset_curr)
-                        o_end = max(offset_prev, offset_curr)
-                        offsets = [o_start + (o_end - o_start) * t / n_interp for t in range(1, n_interp + 1)]
-                        if offset_curr < offset_prev:
-                            offsets = offsets[::-1]
-                        for off in offsets:
-                            pt = edge_geom.interpolate(off)
-                            snapped_lng_i, snapped_lat_i = to_latlon.transform(pt.x, pt.y)
-                            _append_coord(corrected, [snapped_lat_i, snapped_lng_i])
-                    else:
-                        _append_coord(corrected, curr_snap["snapped"])
-                except Exception:
-                    _append_coord(corrected, curr_snap["snapped"])
+                _append_coord(corrected, curr_snap["snapped"])
                 stats["success_segments"] += 1
                 continue
 
@@ -1113,6 +1087,34 @@ def run_sample_correction():
             logger.error("车辆 %s 校正失败: %s", vid, exc)
 
     logger.info("样例校正汇总: %s", summaries)
+
+    # 生成路网校正对比地图（原始 + 校正后轨迹）
+    try:
+        from map_visualization import plot_corrected_trajectory, MAP_OUTPUT_DIR
+        os.makedirs(MAP_OUTPUT_DIR, exist_ok=True)
+        m_corr = plot_corrected_trajectory(
+            SAMPLE_VEHICLES,
+            start_time=SAMPLE_START_TIME,
+            end_time=SAMPLE_END_TIME,
+            enable_correction=True,
+        )
+        corr_path = os.path.join(MAP_OUTPUT_DIR, "06_road_corrected_trajectory.html")
+        m_corr.save(corr_path)
+        logger.info("路网校正对比地图已保存: %s", corr_path)
+    except Exception as exc:
+        logger.error("生成校正对比地图失败: %s", exc)
+
+    # 生成地图选点工具
+    try:
+        from map_visualization import create_point_picker_map, MAP_OUTPUT_DIR
+        os.makedirs(MAP_OUTPUT_DIR, exist_ok=True)
+        m_pick = create_point_picker_map()
+        pick_path = os.path.join(MAP_OUTPUT_DIR, "06_point_picker.html")
+        m_pick.save(pick_path)
+        logger.info("地图选点工具已保存: %s", pick_path)
+    except Exception as exc:
+        logger.error("生成地图选点工具失败: %s", exc)
+
     return summaries
 
 

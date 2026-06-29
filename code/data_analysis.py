@@ -60,6 +60,100 @@ plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode M
 plt.rcParams['axes.unicode_minus'] = False
 
 
+# ===================== 中间结果磁盘缓存 =====================
+# 思路：耗时的中间计算（读取大量分钟级CSV、DBSCAN聚类、热力点聚合等）
+# 用 pickle 缓存到磁盘；缓存键由"函数名 + 调用参数 + 依赖文件指纹"算出。
+# 依赖文件指纹 = 各依赖路径的 (修改时间, 文件大小)，只要数据缓存文件
+# 被更新过（mtime变化）或者文件数变化（比如分钟缓存新增/删除了文件），
+# 指纹就会变化，自动判定需要重算，不需要手动清缓存目录。
+import functools
+import hashlib
+import pickle
+import time
+
+CACHE_DIR = os.path.join(BASE_DIR, "../data/cache/_analysis_cache")
+
+
+def _path_fingerprint(path: str):
+    """返回单个文件/目录的指纹：(存在性, mtime, size) 或目录下文件列表的聚合指纹。"""
+    if not os.path.exists(path):
+        return ("missing",)
+    if os.path.isdir(path):
+        entries = []
+        for name in sorted(os.listdir(path)):
+            full = os.path.join(path, name)
+            if os.path.isfile(full):
+                stat = os.stat(full)
+                entries.append((name, stat.st_mtime_ns, stat.st_size))
+        return tuple(entries)
+    stat = os.stat(path)
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _compute_cache_key(func_name: str, dep_paths, args, kwargs):
+    """依赖文件指纹 + 函数名 + 调用参数 一起算哈希，作为缓存文件名。"""
+    fingerprint_parts = [func_name]
+    for path in dep_paths:
+        fingerprint_parts.append(path)
+        fingerprint_parts.append(repr(_path_fingerprint(path)))
+    fingerprint_parts.append(repr(args))
+    fingerprint_parts.append(repr(sorted(kwargs.items())))
+    raw = "||".join(fingerprint_parts).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:24]
+
+
+def disk_cached(dep_paths_fn):
+    """
+    缓存装饰器。dep_paths_fn(*args, **kwargs) -> list[str]，返回本次调用
+    实际依赖的文件/目录路径列表（用于计算指纹，判断缓存是否失效）。
+
+    被装饰函数的返回值必须是可 pickle 的对象（DataFrame、list、tuple等）。
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            dep_paths = dep_paths_fn(*args, **kwargs)
+            cache_key = _compute_cache_key(func.__name__, dep_paths, args, kwargs)
+            cache_file = os.path.join(CACHE_DIR, f"{cache_key}.pkl")
+
+            if os.path.exists(cache_file):
+                try:
+                    with open(cache_file, 'rb') as f:
+                        cached = pickle.load(f)
+                    print(f"[缓存命中] {func.__name__} <- {os.path.basename(cache_file)}")
+                    return cached
+                except Exception as exc:
+                    # 缓存文件损坏/版本不兼容时不要让整个流程崩溃，重新计算并覆盖。
+                    print(f"[缓存读取失败，重新计算] {func.__name__}: {exc}")
+
+            start = time.time()
+            result = func(*args, **kwargs)
+            elapsed = time.time() - start
+            try:
+                with open(cache_file, 'wb') as f:
+                    pickle.dump(result, f)
+                print(f"[缓存写入] {func.__name__} 耗时{elapsed:.2f}s -> {os.path.basename(cache_file)}")
+            except Exception as exc:
+                print(f"[缓存写入失败，不影响本次结果] {func.__name__}: {exc}")
+            return result
+        return wrapper
+    return decorator
+
+
+def clear_analysis_cache():
+    """手动清空所有中间结果缓存（指纹机制通常不需要手动清，仅作应急手段）。"""
+    if not os.path.exists(CACHE_DIR):
+        return 0
+    removed = 0
+    for name in os.listdir(CACHE_DIR):
+        if name.endswith('.pkl'):
+            os.remove(os.path.join(CACHE_DIR, name))
+            removed += 1
+    return removed
+# ==========================================================
+
+
 def ensure_output_dirs():
     for path in [OUTPUT_DIR, FIG_DIR, MAP_DIR, TABLE_DIR]:
         os.makedirs(path, exist_ok=True)
@@ -110,6 +204,7 @@ def build_weighted_heat_points(df: pd.DataFrame, lat_col: str, lon_col: str, pre
     return grouped[[lat_col, lon_col, 'weight']].values.tolist()
 
 
+@disk_cached(lambda: [OD_CACHE_PATH])
 def load_od_cache() -> pd.DataFrame:
     df = pd.read_csv(OD_CACHE_PATH)
     df['开始时间'] = pd.to_datetime(df['开始时间'])
@@ -141,6 +236,7 @@ def haversine_km_series(lon1, lat1, lon2, lat2):
     return 2 * r * np.arcsin(np.sqrt(a.clip(0, 1)))
 
 
+@disk_cached(lambda: [VEHICLE_CACHE_DIR])
 def load_all_vehicle_stats() -> pd.DataFrame:
     vehicle_files = [
         os.path.join(VEHICLE_CACHE_DIR, file_name)
@@ -239,9 +335,15 @@ def _build_heat_time_slices(df: pd.DataFrame, time_col: str, lat_col: str, lon_c
     return data, time_labels
 
 
-def build_dynamic_pickup_heatmap(freq='15min', output_name='03_dynamic_pickup_heatmap_15min.html'):
+@disk_cached(lambda freq='15min', output_name='03_dynamic_pickup_heatmap_15min.html': [OD_CACHE_PATH])
+def _build_dynamic_pickup_heat_frames(freq='15min'):
+    """计算动态上车点热力图各时间片的聚合数据（耗时部分，可缓存）。"""
     df = load_od_cache()
-    data, time_labels = _build_heat_time_slices(df, '开始时间', '开始纬度', '开始经度', freq)
+    return _build_heat_time_slices(df, '开始时间', '开始纬度', '开始经度', freq)
+
+
+def build_dynamic_pickup_heatmap(freq='15min', output_name='03_dynamic_pickup_heatmap_15min.html'):
+    data, time_labels = _build_dynamic_pickup_heat_frames(freq=freq)
     out_path = os.path.join(MAP_DIR, output_name)
     build_custom_dynamic_heatmap_html(
         title=f'上车点动态热力图（{freq}）',
@@ -254,7 +356,9 @@ def build_dynamic_pickup_heatmap(freq='15min', output_name='03_dynamic_pickup_he
     return out_path
 
 
-def build_dynamic_vehicle_heatmap(freq='60min', output_name='04_dynamic_vehicle_heatmap_60min.html'):
+@disk_cached(lambda: [MINUTE_CACHE_DIR])
+def _load_all_minute_snapshots_concat() -> pd.DataFrame:
+    """把 MINUTE_CACHE_DIR 下所有分钟级CSV读出来拼成一张大表（车辆位置全天数据）。"""
     minute_files = sorted([f for f in os.listdir(MINUTE_CACHE_DIR) if f.endswith('.csv')])
     records = []
     for file_name in minute_files:
@@ -262,9 +366,18 @@ def build_dynamic_vehicle_heatmap(freq='60min', output_name='04_dynamic_vehicle_
         df = pd.read_csv(os.path.join(MINUTE_CACHE_DIR, file_name))
         df['time'] = dt
         records.append(df[['time', 'lati', 'long']])
-    df_all = pd.concat(records, ignore_index=True)
+    return pd.concat(records, ignore_index=True)
 
-    data, time_labels = _build_heat_time_slices(df_all, 'time', 'lati', 'long', freq)
+
+@disk_cached(lambda freq='60min': [MINUTE_CACHE_DIR])
+def _build_dynamic_vehicle_heat_frames(freq='60min'):
+    """计算动态车辆位置热力图各时间片的聚合数据（耗时部分，可缓存）。"""
+    df_all = _load_all_minute_snapshots_concat()
+    return _build_heat_time_slices(df_all, 'time', 'lati', 'long', freq)
+
+
+def build_dynamic_vehicle_heatmap(freq='60min', output_name='04_dynamic_vehicle_heatmap_60min.html'):
+    data, time_labels = _build_dynamic_vehicle_heat_frames(freq=freq)
     out_path = os.path.join(MAP_DIR, output_name)
     build_custom_dynamic_heatmap_html(
         title=f'车辆位置动态热力图（{freq}）',
@@ -373,7 +486,9 @@ def build_custom_dynamic_heatmap_html(title: str, data, time_labels, output_path
         f.write(html)
 
 
-def run_pickup_dbscan(output_name='pickup_dbscan_clusters.csv'):
+@disk_cached(lambda: [OD_CACHE_PATH])
+def _compute_pickup_dbscan_clusters() -> pd.DataFrame:
+    """纯计算部分：对每个15分钟时间片做DBSCAN聚类，返回聚类中心表（耗时，可缓存）。"""
     df = load_od_cache().copy()
     df['time_slice'] = df['开始时间'].dt.floor('15min')
     cluster_rows = []
@@ -396,7 +511,13 @@ def run_pickup_dbscan(output_name='pickup_dbscan_clusters.csv'):
                 'cluster_id': int(cluster_id),
             })
 
-    out_df = pd.DataFrame(cluster_rows)
+    return pd.DataFrame(cluster_rows)
+
+
+def run_pickup_dbscan(output_name='pickup_dbscan_clusters.csv'):
+    # 计算部分走缓存；写文件这个副作用每次都执行（哪怕数据来自缓存），
+    # 保证表文件始终是最新生成的，不会因为命中缓存而漏写。
+    out_df = _compute_pickup_dbscan_clusters()
     out_path = os.path.join(TABLE_DIR, output_name)
     out_df.to_csv(out_path, index=False, encoding='utf-8-sig')
     return out_df, out_path
@@ -534,8 +655,7 @@ def plot_duration_distribution(df_od: pd.DataFrame, output_name='02_order_durati
 
 
 def export_dynamic_heatmap_data(freq='15min', output_name='dynamic_pickup_heatmap_15min.json'):
-    df = load_od_cache()
-    data, labels = _build_heat_time_slices(df, '开始时间', '开始纬度', '开始经度', freq)
+    data, labels = _build_dynamic_pickup_heat_frames(freq=freq)
     output = [{'time': label, 'points': points} for label, points in zip(labels, data)]
     out_path = os.path.join(TABLE_DIR, output_name)
     with open(out_path, 'w', encoding='utf-8') as f:
@@ -576,4 +696,9 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == '--clear-cache':
+        removed = clear_analysis_cache()
+        print(f'已清空中间结果缓存，删除 {removed} 个缓存文件。')
+    else:
+        main()
