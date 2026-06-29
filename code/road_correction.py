@@ -36,15 +36,14 @@ LOG_PATH = os.path.join(PROJECT_ROOT, "docs", "road_correction_log.txt")
 MAX_GPS_SEGMENT_METERS = 2000
 
 # GPS 点距离最近道路过远时，认为不可靠，不参与路网吸附
-MAX_SNAP_DISTANCE_METERS = 80
+MAX_SNAP_DISTANCE_METERS = 50
 
 # 如果路网路径相对 GPS 直线距离绕行过大，则拒绝该段校正
 MAX_ROUTE_DETOUR_RATIO = 4.0
 MAX_ROUTE_EXTRA_METERS = 500
-# 候选搜索半径与候选数适度放宽：深圳主辅路/立交并行路段较多，过窄的
-# 搜索范围或过少的候选数容易让真正应匹配的道路漏出候选集之外。
-MAX_CANDIDATE_SEARCH_METERS = 150
-MAX_CANDIDATES_PER_POINT = 8
+# 候选搜索半径与候选数收紧，减少高架/地面道路同时入选导致轨迹分叉。
+MAX_CANDIDATE_SEARCH_METERS = 80
+MAX_CANDIDATES_PER_POINT = 5
 MAX_SEGMENT_TIME_GAP_SECONDS = 90
 MAX_SEGMENT_SPEED_MPS = 35
 EMISSION_SIGMA_METERS = 20
@@ -245,8 +244,10 @@ def _geometry_to_latlngs(geometry):
     return [[lat, lng] for lng, lat in coords]
 
 
-def _best_edge_geometry_between_nodes(G, u, v):
-    """在多重边中选择最短的那条边几何。"""
+def _best_edge_geometry_between_nodes(G, u, v, key=None):
+    """返回 u->v 边的几何；指定 key 时用匹配边，否则取最短平行边。"""
+    if key is not None:
+        return _edge_geometry(G, u, v, key)
     edge_bundle = G.get_edge_data(u, v)
     if not edge_bundle:
         return LineString([
@@ -263,32 +264,152 @@ def _best_edge_geometry_between_nodes(G, u, v):
     ])
 
 
-def _route_to_geometry_coords(G, path, start_snap=None, end_snap=None):
-    """按真实道路边几何输出路线坐标，避免节点直连造成飞线。"""
+def _oriented_edge_latlngs(G, u, v, key=None):
+    """将边几何转为从 u 指向 v 的 [lat, lng] 序列。"""
+    geometry = _best_edge_geometry_between_nodes(G, u, v, key=key)
+    segment_coords = _geometry_to_latlngs(geometry)
+    if not segment_coords:
+        return []
+    u_coord = _node_lat_lng(G, u)
+    if _haversine_meters(segment_coords[0][0], segment_coords[0][1], u_coord[0], u_coord[1]) > \
+            _haversine_meters(segment_coords[-1][0], segment_coords[-1][1], u_coord[0], u_coord[1]):
+        segment_coords.reverse()
+    return segment_coords
+
+
+def _snap_fraction(snap):
+    """吸附点在边上的归一化位置（0=u 端，1=v 端）。"""
+    total = snap["distance_to_u_m"] + snap["distance_to_v_m"]
+    return snap["distance_to_u_m"] / max(total, 1e-6)
+
+
+def _coords_along_edge_fractions(G, snap, frac_from, frac_to):
+    """沿匹配边在 frac_from~frac_to 之间采样坐标。"""
+    u, v, key = snap["edge"]
+    geometry = _best_edge_geometry_between_nodes(G, u, v, key=key)
+    f0, f1 = min(frac_from, frac_to), max(frac_from, frac_to)
+    sample_count = max(2, int(abs(f1 - f0) * 20))
+    coords = []
+    for step in range(sample_count + 1):
+        frac = f0 + (f1 - f0) * step / sample_count
+        pt = geometry.interpolate(frac, normalized=True)
+        _append_coord(coords, [pt.y, pt.x])
+    return coords
+
+
+def _coords_between_snaps_on_same_edge(G, prev_snap, curr_snap):
+    """同一边上从 prev 吸附点走到 curr 吸附点。"""
+    return _coords_along_edge_fractions(
+        G, prev_snap, _snap_fraction(prev_snap), _snap_fraction(curr_snap),
+    )
+
+
+def _coords_snap_to_node_on_edge(G, snap, node):
+    """从吸附点沿边走到指定端点节点。"""
+    u, v, _ = snap["edge"]
+    frac_snap = _snap_fraction(snap)
+    if node == u:
+        return _coords_along_edge_fractions(G, snap, frac_snap, 0.0)
+    if node == v:
+        return _coords_along_edge_fractions(G, snap, frac_snap, 1.0)
+    return [snap["snapped"]]
+
+
+def _coords_node_to_snap_on_edge(G, snap, node):
+    """从边端点节点沿边走到吸附点。"""
+    u, v, _ = snap["edge"]
+    frac_snap = _snap_fraction(snap)
+    if node == u:
+        return _coords_along_edge_fractions(G, snap, 0.0, frac_snap)
+    if node == v:
+        return _coords_along_edge_fractions(G, snap, 1.0, frac_snap)
+    return [snap["snapped"]]
+
+
+def _edge_key_for_hop(prev_snap, curr_snap, u, v, hop_index, hop_count):
+    """为路径中的某条边选择几何 key，优先使用匹配到的边。"""
+    if hop_index == 0 and prev_snap:
+        u_p, v_p, key_p = prev_snap["edge"]
+        if (u, v) == (u_p, v_p):
+            return key_p
+    if hop_index == hop_count - 1 and curr_snap:
+        u_c, v_c, key_c = curr_snap["edge"]
+        if (u, v) == (u_c, v_c):
+            return key_c
+    return None
+
+
+def _route_to_geometry_coords(G, path, prev_snap, curr_snap, route):
+    """按真实道路边几何输出路线坐标，并在起终点按吸附点裁剪。"""
     if not path:
         return []
 
+    if route.get("graph_used") == "same_edge":
+        return _coords_between_snaps_on_same_edge(G, prev_snap, curr_snap)
+
     coords = []
-    if start_snap is not None:
-        _append_coord(coords, start_snap)
+    start_node = route.get("start_node")
+    end_node = route.get("end_node")
+
+    if prev_snap is not None and start_node is not None:
+        for coord in _coords_snap_to_node_on_edge(G, prev_snap, start_node):
+            _append_coord(coords, coord)
 
     if len(path) == 1:
-        _append_coord(coords, _node_lat_lng(G, path[0]))
-    else:
-        for u, v in zip(path[:-1], path[1:]):
-            geometry = _best_edge_geometry_between_nodes(G, u, v)
-            segment_coords = _geometry_to_latlngs(geometry)
-            if segment_coords:
-                u_coord = _node_lat_lng(G, u)
-                if _haversine_meters(segment_coords[0][0], segment_coords[0][1], u_coord[0], u_coord[1]) > \
-                        _haversine_meters(segment_coords[-1][0], segment_coords[-1][1], u_coord[0], u_coord[1]):
-                    segment_coords.reverse()
-                for coord in segment_coords:
-                    _append_coord(coords, coord)
+        if end_node is not None and curr_snap is not None:
+            for coord in _coords_node_to_snap_on_edge(G, curr_snap, end_node):
+                _append_coord(coords, coord)
+        return coords
 
-    if end_snap is not None:
-        _append_coord(coords, end_snap)
+    hop_count = len(path) - 1
+    for hop_index, (u, v) in enumerate(zip(path[:-1], path[1:])):
+        edge_key = _edge_key_for_hop(prev_snap, curr_snap, u, v, hop_index, hop_count)
+        for coord in _oriented_edge_latlngs(G, u, v, key=edge_key):
+            _append_coord(coords, coord)
+
+    if curr_snap is not None and end_node is not None:
+        for coord in _coords_node_to_snap_on_edge(G, curr_snap, end_node):
+            _append_coord(coords, coord)
     return coords
+
+
+def _append_snap_segment(G, G_directed, G_undirected, corrected, prev_snap, curr_snap,
+                         use_undirected=False):
+    """将 prev/curr 吸附点沿路网连接后追加到 corrected。"""
+    if prev_snap["edge"] == curr_snap["edge"]:
+        for coord in _coords_between_snaps_on_same_edge(G, prev_snap, curr_snap):
+            _append_coord(corrected, coord)
+        return True
+
+    route = _choose_best_route(G_directed, G_undirected, prev_snap, curr_snap, use_undirected=use_undirected)
+    if route is None:
+        _append_coord(corrected, curr_snap["snapped"])
+        return False
+
+    for coord in _route_to_geometry_coords(G, route["path"], prev_snap, curr_snap, route):
+        _append_coord(corrected, coord)
+    return True
+
+
+def _best_candidate_index(candidates, gps_bearing=None, max_snap_distance_m=MAX_SNAP_DISTANCE_METERS):
+    """在候选边中选择兼顾距离与方向的兜底索引。"""
+
+    def score(idx):
+        cand = candidates[idx]
+        if cand["snap_distance_m"] > max_snap_distance_m:
+            return float("inf")
+        cost = cand["snap_distance_m"]
+        if gps_bearing is not None and cand["oneway"]:
+            diff = _angle_diff_degrees(gps_bearing, cand["edge_bearing"])
+            if diff > MAX_DIRECTION_DIFF_DEGREES:
+                return float("inf")
+            cost += diff * 0.5
+        return cost
+
+    ranked = sorted(range(len(candidates)), key=score)
+    if ranked and score(ranked[0]) < float("inf"):
+        return ranked[0]
+    return min(range(len(candidates)), key=lambda idx: candidates[idx]["snap_distance_m"])
 
 
 def _edge_geometry(G, u, v, key):
@@ -337,10 +458,14 @@ def _snap_gps_point_to_edge(G, G_projected, lat, lng, edge=None):
     osmid = edge_data.get("osmid")
     if isinstance(osmid, (list, tuple)):
         osmid = frozenset(osmid)
+    highway = edge_data.get("highway")
+    if isinstance(highway, (list, tuple)):
+        highway = highway[0] if highway else None
 
     return {
         "edge": (u, v, key),
         "osmid": osmid,
+        "highway": highway,
         "snapped": [snapped_lat, snapped_lng],
         "snap_distance_m": snap_distance_m,
         "distance_to_u_m": offset,
@@ -426,6 +551,45 @@ LINK_HIGHWAY_TYPES = {
     "secondary_link", "tertiary_link",
 }
 
+# service/unclassified/living_street 等是真实存在、车辆确实会经过的道路
+# （小区内部车道、停车场进出口、环楼车道等），不应被排除，但它们往往
+# 紧贴主路、几何上离 GPS 点同样近，纯距离打分容易让 Viterbi 在主路和
+# 这类支路间反复跳变，甚至被诱导绕进停车场/环楼车道转一圈再绕出来。
+# 给这类边的 emission（吸附匹配度）施加一个固定惩罚，让它们只有在
+# GPS 点明显更贴近、且没有更合理的主路候选时才会胜出。
+MINOR_HIGHWAY_TYPES = {
+    "service", "unclassified", "living_street", "track", "pedestrian",
+}
+MINOR_HIGHWAY_EMISSION_PENALTY = 18
+
+# service/unclassified 等支路在“两点之间找最短路径”时也需要被压制，
+# 否则即便吸附阶段选对了主路上的端点，最短路径搜索仍可能为了省几米
+# 而绕进停车场进出口、环楼车道再绕出来——这是比吸附错误更隐蔽的问题，
+# 因为两端的吸附点本身完全正确，错误只发生在“怎么连接这两点”这一步。
+# 做法：给每条边一个 routing_weight 属性，等于 length 乘以等级系数；
+# 最短路径搜索统一改用 routing_weight 而不是原始 length，这样比较
+# “真实距离”的地方（绕行阈值判断等）不受影响，只有路径搜索本身的
+# 选择会被引导远离这类支路。
+MINOR_HIGHWAY_WEIGHT_MULTIPLIER = 6.0
+ROUTING_WEIGHT_ATTR = "routing_weight"
+
+
+def _ensure_routing_weights(G):
+    """为图的每条边补充 routing_weight 属性（length 按道路等级加权）。
+    幂等：已经处理过的图（带标记属性）直接跳过，避免重复图遍历。
+    """
+    if G.graph.get("_routing_weights_set"):
+        return G
+    for u, v, key, data in G.edges(keys=True, data=True):
+        length = data.get("length", 1.0) or 1.0
+        highway = data.get("highway")
+        if isinstance(highway, (list, tuple)):
+            highway = highway[0] if highway else None
+        multiplier = MINOR_HIGHWAY_WEIGHT_MULTIPLIER if highway in MINOR_HIGHWAY_TYPES else 1.0
+        G[u][v][key][ROUTING_WEIGHT_ATTR] = length * multiplier
+    G.graph["_routing_weights_set"] = True
+    return G
+
 # 匝道/环形道路天然弧长远大于弦长，绕行比例和绕行余量都应放宽，
 # 否则真实的弯道路径会被系统性地判定为"绕行过大"而拒绝。
 RAMP_DETOUR_RATIO_MULTIPLIER = 2.5
@@ -433,7 +597,16 @@ RAMP_DETOUR_EXTRA_MULTIPLIER = 2.5
 
 # 同一条 OSM 道路（osmid）连续匹配时给予的转移代价折扣，抑制在立交处
 # 因为候选边密集、方向相近而在相邻匝道之间反复跳变。
-SAME_ROAD_CONTINUITY_BONUS = 15
+SAME_ROAD_CONTINUITY_BONUS = 35
+
+# 无向图兜底候选的惩罚系数。无向图不考虑单行/道路类型限制，找到的
+# 路径可能实际不可通行（例如误连到旁边的步道/绿道）。早期用固定惩罚
+# （150米）在两条平行道路靠得很近时完全不够用——步道和主路物理距离
+# 可能只差几十米，固定惩罚根本拦不住。改为与该路径的 route_length_m
+# 成比例的惩罚，路径越长，无向图相对有向图"抄近道"的优势越要打折，
+# 同时设一个较高的下限，确保短距离段也有足够的拦截力度。
+UNDIRECTED_FALLBACK_PENALTY_RATIO = 0.6
+UNDIRECTED_FALLBACK_PENALTY_MIN_M = 200
 
 
 def _edge_highway_type(G, u, v, key):
@@ -452,6 +625,25 @@ def _edge_osmid(G, u, v, key):
     if isinstance(osmid, (list, tuple)):
         return frozenset(osmid)
     return osmid
+
+
+def _path_real_length_m(G, path):
+    """计算路径的真实物理长度（原始 length 累加，不含道路等级加权）。
+
+    用于在改用 routing_weight 做最短路径搜索之后，仍然能拿到准确的
+    真实距离——绕行阈值判断、ramp_ratio 等下游逻辑都应该基于真实距离，
+    不应该被为了引导路径选择而人为放大的权重污染。
+    """
+    if not path or len(path) < 2:
+        return 0.0
+    total = 0.0
+    for u, v in zip(path[:-1], path[1:]):
+        edge_bundle = G.get_edge_data(u, v)
+        if not edge_bundle:
+            continue
+        best_key = min(edge_bundle, key=lambda item: edge_bundle[item].get("length", float("inf")))
+        total += edge_bundle[best_key].get("length", 0.0) or 0.0
+    return total
 
 
 def _path_ramp_ratio(G, path):
@@ -518,6 +710,8 @@ def _choose_best_route(G_directed, G_undirected, prev_snap, curr_snap, use_undir
                 "route_length_m": same_edge_len,
                 "total_cost_m": same_edge_len,
                 "ramp_ratio": 1.0 if highway in LINK_HIGHWAY_TYPES else 0.0,
+                "start_node": u if curr_snap["distance_to_u_m"] >= prev_snap["distance_to_u_m"] else v,
+                "end_node": v if curr_snap["distance_to_u_m"] >= prev_snap["distance_to_u_m"] else u,
             }
 
     primary_graph = G_undirected if use_undirected else G_directed
@@ -556,27 +750,44 @@ def _choose_best_route(G_directed, G_undirected, prev_snap, curr_snap, use_undir
         for start_node, start_cost in prev_nodes:
             for end_node, end_cost in curr_nodes:
                 try:
-                    route_length = nx.shortest_path_length(graph, start_node, end_node, weight="length")
-                    route_path = nx.shortest_path(graph, start_node, end_node, weight="length")
+                    route_length = nx.shortest_path_length(graph, start_node, end_node, weight=ROUTING_WEIGHT_ATTR)
+                    route_path = nx.shortest_path(graph, start_node, end_node, weight=ROUTING_WEIGHT_ATTR)
+                    real_length = _path_real_length_m(graph, route_path)
                     candidates.append({
                         "path": route_path,
                         "graph_used": graph_used,
-                        "route_length_m": route_length,
-                        "total_cost_m": start_cost + route_length + end_cost,
+                        "route_length_m": real_length,
+                        "total_cost_m": start_cost + real_length + end_cost,
                         "ramp_ratio": _path_ramp_ratio(G_directed, route_path),
+                        "start_node": start_node,
+                        "end_node": end_node,
                     })
                     found_in_this_graph = True
                 except nx.NetworkXNoPath:
                     continue
 
-        # 只有在主图（有向图）完全找不到路径时才进入无向图兜底，
-        # 避免有向图里本来有解却被无向图"更短但违反方向"的路径抢走。
+        # 仅当有向图（含 prev/curr 两端的所有合法组合）彻底找不到路径时，
+        # 才进入无向图兜底——这通常对应单行限制把图切断的极端场景。
+        # 若有向图本身能找到路，就不再让无向图参与比较：无向图不检查
+        # 道路类型，两条物理距离很近但属性完全不同的路（主路 vs 步道/
+        # 绿道）在无向图里会被一视同仁，容易在湖边、绿道并行路段把校正
+        # 结果带偏到错误的平行道路上。
         if found_in_this_graph:
             break
 
     if not candidates:
         return None
-    return min(candidates, key=lambda item: item["total_cost_m"])
+
+    def _scored_cost(item):
+        if item["graph_used"] != "undirected_fallback":
+            return item["total_cost_m"]
+        penalty = max(
+            item["route_length_m"] * UNDIRECTED_FALLBACK_PENALTY_RATIO,
+            UNDIRECTED_FALLBACK_PENALTY_MIN_M,
+        )
+        return item["total_cost_m"] + penalty
+
+    return min(candidates, key=_scored_cost)
 
 
 def _viterbi_match_candidates(candidate_sets, movement_bearings, lats, lngs, G_directed, G_undirected,
@@ -602,7 +813,10 @@ def _viterbi_match_candidates(candidate_sets, movement_bearings, lats, lngs, G_d
                 emission_row.append(float("inf"))
             else:
                 z = cand["snap_distance_m"] / EMISSION_SIGMA_METERS
-                emission_row.append(0.5 * z * z + math.log(EMISSION_SIGMA_METERS))
+                cost = 0.5 * z * z + math.log(EMISSION_SIGMA_METERS)
+                if cand.get("highway") in MINOR_HIGHWAY_TYPES:
+                    cost += MINOR_HIGHWAY_EMISSION_PENALTY
+                emission_row.append(cost)
         emissions.append(emission_row)
 
     dp_costs = [emissions[0][:]]
@@ -666,7 +880,10 @@ def _viterbi_match_candidates(candidate_sets, movement_bearings, lats, lngs, G_d
                     ) * REVERSE_DIRECTION_PENALTY
                     transition_cost += dir_penalty
                 if route["graph_used"] == "undirected_fallback":
-                    continue
+                    transition_cost += max(
+                        route["route_length_m"] * UNDIRECTED_FALLBACK_PENALTY_RATIO,
+                        UNDIRECTED_FALLBACK_PENALTY_MIN_M,
+                    )
                 total_cost = dp_costs[i - 1][prev_idx] + transition_cost + emissions[i][curr_idx]
                 if total_cost < row_costs[curr_idx]:
                     row_costs[curr_idx] = total_cost
@@ -714,11 +931,8 @@ def _viterbi_match_candidates(candidate_sets, movement_bearings, lats, lngs, G_d
             filled[offset + j] = idx
         for j in range(offset):
             candidates = candidate_sets[j]
-            best_idx = min(
-                range(len(candidates)),
-                key=lambda k: candidates[k]["snap_distance_m"],
-            )
-            filled[j] = best_idx
+            bearing = movement_bearings[j] if j < len(movement_bearings) else None
+            filled[j] = _best_candidate_index(candidates, gps_bearing=bearing)
         path_indices = filled
 
     selected = [candidate_sets[i][cand_idx] for i, cand_idx in enumerate(path_indices)]
@@ -809,8 +1023,8 @@ def correct_trajectory(df, G=None, use_undirected=False,
     df = _compress_stationary_points(df)
     original_coords = df[["lati", "long"]].values.tolist()
 
-    G_directed = G
-    G_undirected = G.to_undirected()
+    G_directed = _ensure_routing_weights(G)
+    G_undirected = _ensure_routing_weights(G.to_undirected())
     corrected = []
     matched_nodes = []
     debug_segments = []
@@ -856,13 +1070,9 @@ def correct_trajectory(df, G=None, use_undirected=False,
             snapped_points = matched["selected"]
             path_indices = matched["path_indices"]
 
-        segment_corrected_start = len(corrected)
-        segment_debug_start = len(debug_segments)
         seg_total_before = stats["total_segments"]
-        seg_success_before = stats["success_segments"]
-        seg_failed_before = stats["failed_segments"]
-        seg_skipped_before = stats["skipped_segments"]
         seg_rejected_before = stats["rejected_segments"]
+        seg_failed_before = stats["failed_segments"]
 
         matched_nodes.extend([snap["edge"][0] for snap in snapped_points])
         _append_coord(corrected, snapped_points[0]["snapped"])
@@ -874,13 +1084,20 @@ def correct_trajectory(df, G=None, use_undirected=False,
             lat_curr, lng_curr = seg_lats[i], seg_lngs[i]
 
             if prev_snap["snap_distance_m"] > max_snap_distance_m or curr_snap["snap_distance_m"] > max_snap_distance_m:
-                _append_coord(corrected, [lat_curr, lng_curr])
+                loose_limit = max_snap_distance_m * 1.5
+                if prev_snap["snap_distance_m"] <= loose_limit and curr_snap["snap_distance_m"] <= loose_limit:
+                    _append_snap_segment(
+                        G, G_directed, G_undirected, corrected, prev_snap, curr_snap, use_undirected=use_undirected,
+                    )
+                else:
+                    fallback = curr_snap["snapped"] if curr_snap["snap_distance_m"] <= loose_limit else [lat_curr, lng_curr]
+                    _append_coord(corrected, fallback)
                 stats["offroad_points"] += int(prev_snap["snap_distance_m"] > max_snap_distance_m) + int(curr_snap["snap_distance_m"] > max_snap_distance_m)
                 stats["skipped_segments"] += 1
                 debug_segments.append({
                     "type": "offroad",
                     "coords": [[lat_prev, lng_prev], [lat_curr, lng_curr]],
-                    "message": f"片段{seg_index} 段{i}: 点距道路过远，回退原始GPS",
+                    "message": f"片段{seg_index} 段{i}: 点距道路过远，优先沿路网吸附",
                 })
                 continue
 
@@ -889,12 +1106,15 @@ def correct_trajectory(df, G=None, use_undirected=False,
             gps_bearing = seg_bearings[i - 1]
 
             if dist_m > max_gps_segment_m:
-                _append_coord(corrected, [lat_curr, lng_curr])
+                if curr_snap["snap_distance_m"] <= max_snap_distance_m:
+                    _append_coord(corrected, curr_snap["snapped"])
+                else:
+                    _append_coord(corrected, [lat_curr, lng_curr])
                 stats["skipped_segments"] += 1
                 debug_segments.append({
                     "type": "jump",
                     "coords": [[lat_prev, lng_prev], [lat_curr, lng_curr]],
-                    "message": f"片段{seg_index} 段{i}: GPS跳点过大，回退原始GPS",
+                    "message": f"片段{seg_index} 段{i}: GPS跳点过大，保留吸附点",
                 })
                 logger.warning(
                     "片段 %d 段 %d GPS 间距过大(%.0fm)，跳过最短路径 | (%f,%f)->(%f,%f)",
@@ -906,15 +1126,18 @@ def correct_trajectory(df, G=None, use_undirected=False,
             if same_edge:
                 curr_dir_diff = _angle_diff_degrees(gps_bearing, curr_snap["edge_bearing"]) if gps_bearing is not None else None
                 if curr_snap["oneway"] and curr_dir_diff is not None and curr_dir_diff > MAX_DIRECTION_DIFF_DEGREES:
-                    _append_coord(corrected, curr_snap["snapped"])
+                    _append_snap_segment(
+                        G, G_directed, G_undirected, corrected, prev_snap, curr_snap, use_undirected=use_undirected,
+                    )
                     stats["rejected_segments"] += 1
                     debug_segments.append({
                         "type": "direction_warning",
                         "coords": [[lat_prev, lng_prev], [lat_curr, lng_curr]],
-                        "message": f"片段{seg_index} 段{i}: 同边但单行方向冲突({curr_dir_diff:.0f}°)，回退吸附点",
+                        "message": f"片段{seg_index} 段{i}: 同边但单行方向冲突({curr_dir_diff:.0f}°)，沿边连接",
                     })
                     continue
-                _append_coord(corrected, curr_snap["snapped"])
+                for coord in _coords_between_snaps_on_same_edge(G, prev_snap, curr_snap):
+                    _append_coord(corrected, coord)
                 stats["success_segments"] += 1
                 continue
 
@@ -926,7 +1149,9 @@ def correct_trajectory(df, G=None, use_undirected=False,
             if route is None:
                 route = _choose_best_route(G_directed, G_undirected, prev_snap, curr_snap, use_undirected=use_undirected)
             if route is None:
-                _append_coord(corrected, curr_snap["snapped"])
+                _append_snap_segment(
+                    G, G_directed, G_undirected, corrected, prev_snap, curr_snap, use_undirected=use_undirected,
+                )
                 stats["failed_segments"] += 1
                 failure = {
                     "segment_index": i,
@@ -941,7 +1166,7 @@ def correct_trajectory(df, G=None, use_undirected=False,
                 debug_segments.append({
                     "type": "route_failed",
                     "coords": [[lat_prev, lng_prev], [lat_curr, lng_curr]],
-                    "message": f"片段{seg_index} 段{i}: 路网路径失败，回退原始GPS",
+                    "message": f"片段{seg_index} 段{i}: 路网路径失败，沿吸附点连接",
                 })
                 logger.warning(
                     "最短路径失败 | 片段=%d 段=%d | GPS (%.5f,%.5f)->(%.5f,%.5f)",
@@ -956,7 +1181,7 @@ def correct_trajectory(df, G=None, use_undirected=False,
                 debug_segments.append({
                     "type": "detour",
                     "coords": [[lat_prev, lng_prev], [lat_curr, lng_curr]],
-                    "message": f"片段{seg_index} 段{i}: 绕行过大，回退吸附点",
+                    "message": f"片段{seg_index} 段{i}: 绕行过大，跳过该段",
                 })
                 logger.warning(
                     "片段 %d 段 %d 绕行过大(路网=%.0fm, GPS=%.0fm)，拒绝校正 | (%f,%f)->(%f,%f)",
@@ -971,7 +1196,7 @@ def correct_trajectory(df, G=None, use_undirected=False,
                 debug_segments.append({
                     "type": "undirected_fallback",
                     "coords": [[lat_prev, lng_prev], [lat_curr, lng_curr]],
-                    "message": f"片段{seg_index} 段{i}: 仅无向图可达，回退吸附点",
+                    "message": f"片段{seg_index} 段{i}: 仅无向图可达，跳过该段",
                 })
                 continue
 
@@ -981,12 +1206,14 @@ def correct_trajectory(df, G=None, use_undirected=False,
                 (prev_snap["oneway"] and prev_dir_diff > MAX_DIRECTION_DIFF_DEGREES) or
                 (curr_snap["oneway"] and curr_dir_diff > MAX_DIRECTION_DIFF_DEGREES)
             ):
-                _append_coord(corrected, curr_snap["snapped"])
+                _append_snap_segment(
+                    G, G_directed, G_undirected, corrected, prev_snap, curr_snap, use_undirected=use_undirected,
+                )
                 stats["rejected_segments"] += 1
                 debug_segments.append({
                     "type": "direction_warning",
                     "coords": [[lat_prev, lng_prev], [lat_curr, lng_curr]],
-                    "message": f"片段{seg_index} 段{i}: 单行方向冲突(prev={prev_dir_diff:.0f}°, curr={curr_dir_diff:.0f}°)，回退吸附点",
+                    "message": f"片段{seg_index} 段{i}: 单行方向冲突(prev={prev_dir_diff:.0f}°, curr={curr_dir_diff:.0f}°)，沿吸附点连接",
                 })
                 continue
 
@@ -994,35 +1221,27 @@ def correct_trajectory(df, G=None, use_undirected=False,
             path_coords = _route_to_geometry_coords(
                 G,
                 route["path"],
-                start_snap=prev_snap["snapped"],
-                end_snap=curr_snap["snapped"],
+                prev_snap,
+                curr_snap,
+                route,
             )
             for coord in path_coords:
                 _append_coord(corrected, coord)
 
         seg_total = stats["total_segments"] - seg_total_before
-        seg_success = stats["success_segments"] - seg_success_before
-        seg_failed = stats["failed_segments"] - seg_failed_before
-        seg_skipped = stats["skipped_segments"] - seg_skipped_before
         seg_rejected = stats["rejected_segments"] - seg_rejected_before
+        seg_failed = stats["failed_segments"] - seg_failed_before
         seg_problem_ratio = (seg_rejected + seg_failed) / max(seg_total, 1)
         if seg_total > 0 and seg_problem_ratio >= SEGMENT_DEGRADE_REJECT_RATIO:
-            corrected = corrected[:segment_corrected_start]
-            for coord in segment_df[["lati", "long"]].values.tolist():
-                _append_coord(corrected, coord)
-
-            debug_segments = debug_segments[:segment_debug_start]
+            stats["degraded_segments"] += 1
             debug_segments.append({
                 "type": "segment_degraded",
                 "coords": segment_df[["lati", "long"]].values.tolist(),
-                "message": f"片段{seg_index}: 拒绝/失败比例过高({seg_rejected + seg_failed}/{seg_total})，整段降级为原始GPS",
+                "message": (
+                    f"片段{seg_index}: 拒绝/失败比例较高({seg_rejected + seg_failed}/{seg_total})，"
+                    "保留已生成的路网几何"
+                ),
             })
-
-            stats["success_segments"] -= seg_success
-            stats["failed_segments"] -= seg_failed
-            stats["skipped_segments"] -= seg_skipped
-            stats["rejected_segments"] -= seg_rejected
-            stats["degraded_segments"] += 1
 
     corrected_coords = [[lat, lng] for lat, lng in _smooth_debug_backtracks(corrected, debug_segments)]
 
