@@ -7,8 +7,14 @@
 
 import os
 import uuid
+import json
+import pickle
 
 import pandas as pd
+import networkx as nx
+import osmnx as ox
+from shapely.geometry import LineString, Point, mapping
+from shapely.ops import substring
 from flask import Flask, request, render_template_string, send_from_directory, jsonify
 
 from data_analysis import (
@@ -36,6 +42,12 @@ from map_visualization import (
 app = Flask(__name__)
 os.makedirs(MAP_OUTPUT_DIR, exist_ok=True)
 os.makedirs(ANALYSIS_MAP_DIR, exist_ok=True)
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+STAGE7_GRAPH_PATH = os.path.join(PROJECT_ROOT, 'data', 'cache', 'shenzhen_drive_stage7.pkl')
+SHENZHEN_BOUNDARY_PATH = os.path.join(PROJECT_ROOT, 'data', 'raw', '深圳市.json')
+_STAGE7_GRAPH = None
+_SHENZHEN_BOUNDARY = None
 
 
 PAGE_TEMPLATE = """
@@ -243,6 +255,7 @@ PAGE_TEMPLATE = """
       <div class="top-nav">
         <a href="/" class="{{ 'active' if active_page == 'map' else '' }}">地图查询</a>
         <a href="/analysis" class="{{ 'active' if active_page == 'analysis' else '' }}">热力图分析</a>
+        <a href="/routes" class="{{ 'active' if active_page == 'routes' else '' }}">路线规划</a>
       </div>
       <h1>出租车地图交互查询</h1>
       <form method="post" class="panel">
@@ -530,6 +543,7 @@ ANALYSIS_TEMPLATE = """
       <div class="top-nav">
         <a href="/">地图查询</a>
         <a href="/analysis" class="active">热力图分析</a>
+        <a href="/routes">路线规划</a>
       </div>
       <h1>热力图与统计分析</h1>
       <p class="subtitle">在页面中选择热力图或聚类模式，动态生成阶段05结果，并保留统计表输出位置。</p>
@@ -609,6 +623,604 @@ ANALYSIS_TEMPLATE = """
 """
 
 
+ROUTE_TEMPLATE = """
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>出租车路线规划</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    :root {
+      --bg: #f4f7fb;
+      --panel: #ffffff;
+      --line: #d7e0ea;
+      --text: #1d2a38;
+      --muted: #637487;
+      --accent: #0f6cbd;
+      --accent-dark: #0a4f8a;
+      --danger: #b42318;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+      color: var(--text);
+      background: linear-gradient(135deg, #eef4fb 0%, #f8fbff 100%);
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: 360px 1fr;
+      min-height: 100vh;
+    }
+    .top-nav {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 18px;
+      flex-wrap: wrap;
+    }
+    .top-nav a {
+      text-decoration: none;
+      padding: 8px 12px;
+      border-radius: 999px;
+      font-size: 13px;
+      border: 1px solid var(--line);
+      color: var(--text);
+      background: #fff;
+    }
+    .top-nav a.active {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+    .sidebar {
+      padding: 24px;
+      background: rgba(255, 255, 255, 0.96);
+      border-right: 1px solid var(--line);
+      overflow-y: auto;
+    }
+    .main { padding: 20px; }
+    h1 { font-size: 24px; margin: 0 0 8px; }
+    .subtitle {
+      font-size: 14px;
+      color: var(--muted);
+      margin: 0 0 20px;
+      line-height: 1.6;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 16px;
+      margin-bottom: 16px;
+      box-shadow: 0 10px 30px rgba(31, 60, 96, 0.06);
+    }
+    .panel h2 { margin: 0 0 12px; font-size: 16px; }
+    .status {
+      margin-bottom: 12px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      font-size: 14px;
+      background: #edf7ed;
+      color: #1e6b34;
+      border: 1px solid #cde7d1;
+    }
+    .status.error {
+      background: #fdecec;
+      color: var(--danger);
+      border: 1px solid #f7c5c0;
+    }
+    .tips { font-size: 13px; color: var(--muted); line-height: 1.8; }
+    .summary-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px 12px;
+      background: #fafcff;
+    }
+    .metric .label { font-size: 12px; color: var(--muted); }
+    .metric .value { font-size: 16px; margin-top: 4px; }
+    #route-map {
+      width: 100%;
+      height: calc(100vh - 40px);
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      overflow: hidden;
+      box-shadow: 0 10px 30px rgba(31, 60, 96, 0.06);
+    }
+    .legend-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 13px; }
+    .legend-line { width: 30px; height: 4px; border-radius: 99px; }
+    .legend-dash { width: 30px; height: 0; border-top: 2px dashed #7a8a9a; }
+    button {
+      border: 0;
+      border-radius: 10px;
+      padding: 11px 16px;
+      font-size: 14px;
+      cursor: pointer;
+      background: var(--accent);
+      color: #fff;
+      margin-top: 12px;
+    }
+    button:hover { background: var(--accent-dark); }
+    @media (max-width: 1100px) {
+      .layout { grid-template-columns: 1fr; }
+      #route-map { height: 72vh; }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="top-nav">
+        <a href="/">地图查询</a>
+        <a href="/analysis">热力图分析</a>
+        <a href="/routes" class="active">路线规划</a>
+      </div>
+      <h1>最短与最快路线</h1>
+      <p class="subtitle">连续点击地图选择起点和终点。蓝线是最短距离路线，绿线是基准最快路线，灰色虚线用于连接点击位置与吸附到路网后的起终点。</p>
+
+      <div class="panel">
+        <h2>交互说明</h2>
+        <div class="tips">
+          <div>第一次点击设置起点。</div>
+          <div>第二次点击设置终点，并自动计算两条路线。</div>
+          <div>如果想重新选点，点击下方按钮。</div>
+          <div>边界为深圳市行政区范围，仅作参考显示。</div>
+        </div>
+        <button type="button" onclick="resetRoute()">重新选点</button>
+      </div>
+
+      <div id="route-status" class="status">点击地图选择起点。</div>
+
+      <div class="panel">
+        <h2>结果摘要</h2>
+        <div id="route-empty" class="tips">等待路线计算。</div>
+        <div id="route-summary" style="display:none;">
+          <div class="summary-grid">
+            <div class="metric">
+              <div class="label">最短距离</div>
+              <div class="value" id="shortest-distance">-</div>
+            </div>
+            <div class="metric">
+              <div class="label">最短路线成本</div>
+              <div class="value" id="shortest-cost">-</div>
+            </div>
+            <div class="metric">
+              <div class="label">最快路线距离</div>
+              <div class="value" id="fastest-distance">-</div>
+            </div>
+            <div class="metric">
+              <div class="label">最快路线成本</div>
+              <div class="value" id="fastest-cost">-</div>
+            </div>
+            <div class="metric">
+              <div class="label">起点吸附距离</div>
+              <div class="value" id="origin-snap">-</div>
+            </div>
+            <div class="metric">
+              <div class="label">终点吸附距离</div>
+              <div class="value" id="dest-snap">-</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>图例</h2>
+        <div class="legend-row"><span class="legend-line" style="background:blue;"></span><span>最短距离路线</span></div>
+        <div class="legend-row"><span class="legend-line" style="background:green;"></span><span>基准最快路线</span></div>
+        <div class="legend-row"><span class="legend-dash"></span><span>点击位置到路网连接线</span></div>
+        <div class="legend-row"><span class="legend-line" style="background:#123b7a;"></span><span>深圳行政边界</span></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div id="route-map"></div>
+    </main>
+  </div>
+
+  <script>
+    const map = L.map('route-map').setView([22.58, 114.08], 11);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap'
+    }).addTo(map);
+
+    const routeState = {
+      points: [],
+      markers: [],
+      shortest: null,
+      fastest: null,
+      connectors: [],
+      boundary: null,
+      requestSeq: 0,
+      activeRequestSeq: 0,
+    };
+
+    function clearRouteLayers() {
+      if (routeState.shortest) {
+        map.removeLayer(routeState.shortest);
+        routeState.shortest = null;
+      }
+      if (routeState.fastest) {
+        map.removeLayer(routeState.fastest);
+        routeState.fastest = null;
+      }
+      routeState.connectors.forEach(l => map.removeLayer(l));
+      routeState.connectors = [];
+    }
+
+    function setStatus(text, isError=false) {
+      const box = document.getElementById('route-status');
+      box.textContent = text;
+      box.className = isError ? 'status error' : 'status';
+    }
+
+    function resetRoute() {
+      routeState.requestSeq += 1;
+      routeState.activeRequestSeq = routeState.requestSeq;
+      routeState.points = [];
+      routeState.markers.forEach(m => map.removeLayer(m));
+      routeState.markers = [];
+      clearRouteLayers();
+      document.getElementById('route-empty').style.display = 'block';
+      document.getElementById('route-summary').style.display = 'none';
+      setStatus('点击地图选择起点。');
+    }
+
+    function formatDistance(m) {
+      return m >= 1000 ? (m / 1000).toFixed(2) + ' km' : Math.round(m) + ' m';
+    }
+
+    function formatMinutes(sec) {
+      return (sec / 60).toFixed(1) + ' min';
+    }
+
+    function updateSummary(summary) {
+      document.getElementById('route-empty').style.display = 'none';
+      document.getElementById('route-summary').style.display = 'block';
+      document.getElementById('shortest-distance').textContent = formatDistance(summary.shortest_distance_m);
+      document.getElementById('shortest-cost').textContent = formatMinutes(summary.shortest_cost_s);
+      document.getElementById('fastest-distance').textContent = formatDistance(summary.fastest_distance_m);
+      document.getElementById('fastest-cost').textContent = formatMinutes(summary.fastest_cost_s);
+      document.getElementById('origin-snap').textContent = formatDistance(summary.origin_snap_distance_m);
+      document.getElementById('dest-snap').textContent = formatDistance(summary.dest_snap_distance_m);
+    }
+
+    function drawConnector(a, b) {
+      const line = L.polyline([
+        [a.lat, a.lon],
+        [b.lat, b.lon]
+      ], {
+        color: '#7a8a9a',
+        weight: 2,
+        dashArray: '6, 6',
+        opacity: 0.9
+      }).addTo(map);
+      routeState.connectors.push(line);
+    }
+
+    async function loadBoundary() {
+      const resp = await fetch('/api/shenzhen-boundary');
+      const data = await resp.json();
+      if (data.error) { return; }
+      routeState.boundary = L.geoJSON(data, {
+        style: {
+          color: '#123b7a',
+          weight: 2,
+          opacity: 0.9,
+          fillOpacity: 0.02
+        }
+      }).addTo(map);
+    }
+
+    map.on('click', async function(e) {
+      if (routeState.points.length === 2) {
+        resetRoute();
+      }
+
+      const point = { lat: e.latlng.lat, lon: e.latlng.lng };
+      routeState.points.push(point);
+      const label = routeState.points.length === 1 ? '起点' : '终点';
+      const marker = L.marker([point.lat, point.lon]).addTo(map).bindTooltip(label).openTooltip();
+      routeState.markers.push(marker);
+
+      if (routeState.points.length === 1) {
+        setStatus('已选择起点，点击地图选择终点。');
+        return;
+      }
+
+      clearRouteLayers();
+      setStatus('正在计算路线...');
+
+      try {
+        routeState.requestSeq += 1;
+        const currentRequestSeq = routeState.requestSeq;
+        routeState.activeRequestSeq = currentRequestSeq;
+
+        const response = await fetch('/api/routes', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            origin: routeState.points[0],
+            destination: routeState.points[1]
+          })
+        });
+        const result = await response.json();
+
+        if (currentRequestSeq !== routeState.activeRequestSeq) {
+          return;
+        }
+
+        if (!response.ok || result.error) {
+          setStatus(result.error || '路线计算失败。', true);
+          return;
+        }
+
+        routeState.shortest = L.geoJSON(result.shortest, {
+          style: { color: 'blue', weight: 5, opacity: 0.8 }
+        }).addTo(map);
+        routeState.fastest = L.geoJSON(result.fastest, {
+          style: { color: 'green', weight: 5, opacity: 0.8 }
+        }).addTo(map);
+
+        drawConnector(routeState.points[0], result.connectors.origin_snap);
+        drawConnector(routeState.points[1], result.connectors.destination_snap);
+
+        updateSummary(result.summary);
+        const bounds = routeState.shortest.getBounds().extend(routeState.fastest.getBounds());
+        map.fitBounds(bounds.pad(0.15));
+        setStatus('路线计算完成。');
+      } catch (err) {
+        setStatus('请求失败：' + err.message, true);
+      }
+    });
+
+    loadBoundary();
+  </script>
+</body>
+</html>
+"""
+
+
+def _haversine_meters(lat1, lon1, lat2, lon2):
+    from math import radians, sin, cos, sqrt, atan2
+    r = 6371000.0
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+    return r * 2 * atan2(sqrt(a), sqrt(1 - a))
+
+
+def _load_stage7_graph():
+    global _STAGE7_GRAPH
+    if _STAGE7_GRAPH is None:
+        if not os.path.exists(STAGE7_GRAPH_PATH):
+            raise FileNotFoundError(
+                f'未找到带 route_cost 的路网缓存: {STAGE7_GRAPH_PATH}，请先运行 python code/stage7_route.py speed'
+            )
+        with open(STAGE7_GRAPH_PATH, 'rb') as f:
+            _STAGE7_GRAPH = pickle.load(f)
+    return _STAGE7_GRAPH
+
+
+def _load_shenzhen_boundary():
+    global _SHENZHEN_BOUNDARY
+    if _SHENZHEN_BOUNDARY is None:
+        with open(SHENZHEN_BOUNDARY_PATH, 'r', encoding='utf-8') as f:
+            _SHENZHEN_BOUNDARY = json.load(f)
+    return _SHENZHEN_BOUNDARY
+
+
+def _edge_linestring(g, u, v, key, data):
+    geom = data.get('geometry')
+    if geom is not None:
+        return geom
+    return LineString([
+        (float(g.nodes[u]['x']), float(g.nodes[u]['y'])),
+        (float(g.nodes[v]['x']), float(g.nodes[v]['y'])),
+    ])
+
+
+def _safe_speed_kph(data):
+    speed = data.get('baseline_speed_kph')
+    if speed is None or speed <= 0:
+        speed = 30.0
+    return float(speed)
+
+
+def _segment_cost_seconds(length_m, speed_kph):
+    return float(length_m) / max(float(speed_kph), 1.0) * 3.6
+
+
+def _coords_latlon(geom):
+    return [[float(lat), float(lon)] for lon, lat in geom.coords]
+
+
+def _feature_from_geom(geom, properties=None):
+    return {
+        'type': 'Feature',
+        'geometry': mapping(geom),
+        'properties': properties or {},
+    }
+
+
+def _feature_collection(features):
+    return {'type': 'FeatureCollection', 'features': features}
+
+
+def _snap_point_to_edge(g, lon, lat):
+    u, v, key = ox.distance.nearest_edges(g, lon, lat)
+    data = g.edges[u, v, key]
+    geom = _edge_linestring(g, u, v, key, data)
+    point = Point(float(lon), float(lat))
+    progress = geom.project(point, normalized=True)
+    snap_point = geom.interpolate(progress, normalized=True)
+    total_len = max(float(geom.length), 1e-9)
+    forward_ratio = max(0.0, min(1.0, progress))
+    backward_ratio = 1.0 - forward_ratio
+    speed = _safe_speed_kph(data)
+
+    candidates = []
+
+    forward_geom = substring(geom, progress, 1.0, normalized=True)
+    if forward_geom and not forward_geom.is_empty:
+        candidates.append({
+            'node': int(v),
+            'entry_cost_s': _segment_cost_seconds(float(total_len * forward_ratio), speed),
+            'entry_length_m': float(total_len * forward_ratio),
+            'entry_geom': forward_geom,
+        })
+
+    reverse_data = g.get_edge_data(v, u, default={})
+    reverse_key = next(iter(reverse_data.keys()), None) if reverse_data else None
+    if reverse_key is not None:
+        reverse_geom = reverse_data[reverse_key].get('geometry')
+        if reverse_geom is None:
+            reverse_geom = LineString([
+                (float(g.nodes[v]['x']), float(g.nodes[v]['y'])),
+                (float(g.nodes[u]['x']), float(g.nodes[u]['y'])),
+            ])
+        reverse_progress = reverse_geom.project(snap_point, normalized=True)
+        backward_geom = substring(reverse_geom, reverse_progress, 1.0, normalized=True)
+        reverse_speed = _safe_speed_kph(reverse_data[reverse_key])
+        if backward_geom and not backward_geom.is_empty:
+            candidates.append({
+                'node': int(u),
+                'entry_cost_s': _segment_cost_seconds(float(total_len * backward_ratio), reverse_speed),
+                'entry_length_m': float(total_len * backward_ratio),
+                'entry_geom': backward_geom,
+            })
+
+    return {
+        'edge': (int(u), int(v), int(key)),
+        'snap_lon': float(snap_point.x),
+        'snap_lat': float(snap_point.y),
+        'click_lon': float(lon),
+        'click_lat': float(lat),
+        'candidates': candidates,
+    }
+
+
+def _destination_candidates(g, lon, lat):
+    snapped = _snap_point_to_edge(g, lon, lat)
+    u, v, key = snapped['edge']
+    data = g.edges[u, v, key]
+    geom = _edge_linestring(g, u, v, key, data)
+    snap_point = Point(snapped['snap_lon'], snapped['snap_lat'])
+    progress = geom.project(snap_point, normalized=True)
+    total_len = max(float(geom.length), 1e-9)
+    speed = _safe_speed_kph(data)
+
+    candidates = []
+
+    forward_arrival = substring(geom, 0.0, progress, normalized=True)
+    if forward_arrival and not forward_arrival.is_empty:
+        candidates.append({
+            'node': int(u),
+            'exit_cost_s': _segment_cost_seconds(float(total_len * progress), speed),
+            'exit_length_m': float(total_len * progress),
+            'exit_geom': forward_arrival,
+        })
+
+    reverse_data = g.get_edge_data(v, u, default={})
+    reverse_key = next(iter(reverse_data.keys()), None) if reverse_data else None
+    if reverse_key is not None:
+        reverse_geom = reverse_data[reverse_key].get('geometry')
+        if reverse_geom is None:
+            reverse_geom = LineString([
+                (float(g.nodes[v]['x']), float(g.nodes[v]['y'])),
+                (float(g.nodes[u]['x']), float(g.nodes[u]['y'])),
+            ])
+        reverse_progress = reverse_geom.project(snap_point, normalized=True)
+        reverse_total_len = max(float(reverse_geom.length), 1e-9)
+        reverse_speed = _safe_speed_kph(reverse_data[reverse_key])
+        reverse_arrival = substring(reverse_geom, 0.0, reverse_progress, normalized=True)
+        if reverse_arrival and not reverse_arrival.is_empty:
+            candidates.append({
+                'node': int(v),
+                'exit_cost_s': _segment_cost_seconds(float(reverse_total_len * reverse_progress), reverse_speed),
+                'exit_length_m': float(reverse_total_len * reverse_progress),
+                'exit_geom': reverse_arrival,
+            })
+
+    snapped['candidates'] = candidates
+    return snapped
+
+
+def _direct_same_edge_solution(origin_snap, dest_snap, weight_name):
+    if origin_snap['edge'] != dest_snap['edge']:
+        return None
+    if not origin_snap['candidates'] or not dest_snap['candidates']:
+        return None
+
+    g = _load_stage7_graph()
+    u, v, key = origin_snap['edge']
+    data = g.edges[u, v, key]
+    geom = _edge_linestring(g, u, v, key, data)
+
+    origin_point = Point(origin_snap['snap_lon'], origin_snap['snap_lat'])
+    dest_point = Point(dest_snap['snap_lon'], dest_snap['snap_lat'])
+    origin_progress = geom.project(origin_point, normalized=True)
+    dest_progress = geom.project(dest_point, normalized=True)
+    total_len = max(float(geom.length), 1e-9)
+    speed = _safe_speed_kph(data)
+
+    solutions = []
+
+    if dest_progress >= origin_progress:
+        seg = substring(geom, origin_progress, dest_progress, normalized=True)
+        if seg and not seg.is_empty:
+            seg_len = float(total_len * (dest_progress - origin_progress))
+            solutions.append({
+                'route_nodes': [],
+                'middle_features': [_feature_from_geom(seg, {'kind': 'same_edge'})],
+                'distance_m': seg_len,
+                'cost_s': _segment_cost_seconds(seg_len, speed),
+                'edge_count': 1,
+            })
+
+    reverse_data = g.get_edge_data(v, u, default={})
+    reverse_key = next(iter(reverse_data.keys()), None) if reverse_data else None
+    if reverse_key is not None:
+        reverse_geom = reverse_data[reverse_key].get('geometry')
+        if reverse_geom is None:
+            reverse_geom = LineString([
+                (float(g.nodes[v]['x']), float(g.nodes[v]['y'])),
+                (float(g.nodes[u]['x']), float(g.nodes[u]['y'])),
+            ])
+        reverse_speed = _safe_speed_kph(reverse_data[reverse_key])
+        reverse_origin_progress = reverse_geom.project(origin_point, normalized=True)
+        reverse_dest_progress = reverse_geom.project(dest_point, normalized=True)
+        reverse_total_len = max(float(reverse_geom.length), 1e-9)
+        if reverse_dest_progress >= reverse_origin_progress:
+            seg = substring(reverse_geom, reverse_origin_progress, reverse_dest_progress, normalized=True)
+            if seg and not seg.is_empty:
+                seg_len = float(reverse_total_len * (reverse_dest_progress - reverse_origin_progress))
+                solutions.append({
+                    'route_nodes': [],
+                    'middle_features': [_feature_from_geom(seg, {'kind': 'same_edge_reverse'})],
+                    'distance_m': seg_len,
+                    'cost_s': _segment_cost_seconds(seg_len, reverse_speed),
+                    'edge_count': 1,
+                })
+
+    if not solutions:
+        return None
+
+    if weight_name == 'length':
+        return min(solutions, key=lambda item: item['distance_m'])
+    return min(solutions, key=lambda item: item['cost_s'])
+
+
 def _default_form():
     return {
         'mode': 'trajectory',
@@ -634,6 +1246,94 @@ def _default_analysis_form():
         'start_time': '2013-10-22 08:00:00',
         'end_time': '2013-10-22 09:00:00',
         'freq': '15min',
+    }
+
+
+def _compute_stage7_routes(origin_lon, origin_lat, destination_lon, destination_lat):
+    g = _load_stage7_graph()
+
+    origin_snap = _snap_point_to_edge(g, origin_lon, origin_lat)
+    dest_snap = _destination_candidates(g, destination_lon, destination_lat)
+
+    if not origin_snap['candidates']:
+        raise ValueError('起点附近没有可接入的道路方向')
+    if not dest_snap['candidates']:
+        raise ValueError('终点附近没有可接入的道路方向')
+
+    def solve(weight_name):
+        best = None
+
+        direct = _direct_same_edge_solution(origin_snap, dest_snap, weight_name)
+        if direct is not None:
+            best = direct
+
+        for o in origin_snap['candidates']:
+            for d in dest_snap['candidates']:
+                try:
+                    route_nodes = nx.shortest_path(g, o['node'], d['node'], weight=weight_name)
+                except (nx.NodeNotFound, nx.NetworkXNoPath):
+                    continue
+
+                middle_gdf = ox.routing.route_to_gdf(g, route_nodes, weight=weight_name)
+                middle_distance = float(middle_gdf['length'].sum()) if 'length' in middle_gdf else 0.0
+                middle_cost = float(middle_gdf['route_cost'].sum()) if 'route_cost' in middle_gdf else 0.0
+
+                total_distance = o['entry_length_m'] + middle_distance + d['exit_length_m']
+                total_cost = o['entry_cost_s'] + middle_cost + d['exit_cost_s']
+
+                candidate = {
+                    'route_nodes': route_nodes,
+                    'middle_features': json.loads(middle_gdf.to_json())['features'],
+                    'distance_m': total_distance,
+                    'cost_s': total_cost,
+                    'edge_count': max(len(route_nodes) - 1, 0),
+                    'origin_entry_geom': o['entry_geom'],
+                    'dest_exit_geom': d['exit_geom'],
+                }
+
+                key = candidate['distance_m'] if weight_name == 'length' else candidate['cost_s']
+                if best is None:
+                    best = candidate
+                else:
+                    best_key = best['distance_m'] if weight_name == 'length' else best['cost_s']
+                    if key < best_key:
+                        best = candidate
+
+        if best is None:
+            raise ValueError('起终点之间无可达路径')
+
+        features = []
+        if best.get('origin_entry_geom') is not None:
+            features.append(_feature_from_geom(best['origin_entry_geom'], {'kind': 'origin_partial'}))
+        features.extend(best['middle_features'])
+        if best.get('dest_exit_geom') is not None:
+            features.append(_feature_from_geom(best['dest_exit_geom'], {'kind': 'destination_partial'}))
+
+        return {
+            'geojson': _feature_collection(features),
+            'distance_m': float(best['distance_m']),
+            'cost_s': float(best['cost_s']),
+            'edge_count': int(best['edge_count']),
+        }
+
+    shortest = solve('length')
+    fastest = solve('route_cost')
+
+    return {
+        'shortest': shortest,
+        'fastest': fastest,
+        'summary': {
+            'shortest_distance_m': shortest['distance_m'],
+            'shortest_cost_s': shortest['cost_s'],
+            'fastest_distance_m': fastest['distance_m'],
+            'fastest_cost_s': fastest['cost_s'],
+            'origin_snap_distance_m': float(_haversine_meters(origin_lat, origin_lon, origin_snap['snap_lat'], origin_snap['snap_lon'])),
+            'dest_snap_distance_m': float(_haversine_meters(destination_lat, destination_lon, dest_snap['snap_lat'], dest_snap['snap_lon'])),
+        },
+        'connectors': {
+            'origin_snap': {'lat': origin_snap['snap_lat'], 'lon': origin_snap['snap_lon']},
+            'destination_snap': {'lat': dest_snap['snap_lat'], 'lon': dest_snap['snap_lon']},
+        },
     }
 
 
@@ -710,6 +1410,10 @@ def _build_map(form):
             var currentMarker = null;
             function bindPointPicker(map) {{
                 map.on('click', function(e) {{
+                    var coordPanel = document.getElementById('coord-panel');
+                    if (coordPanel && coordPanel.style.display === 'none') {{
+                        return;
+                    }}
                     var lat = e.latlng.lat.toFixed(6);
                     var lon = e.latlng.lng.toFixed(6);
                     document.getElementById('pick-lat').textContent = lat;
@@ -848,6 +1552,11 @@ def analysis_page():
     )
 
 
+@app.route('/routes')
+def route_page():
+    return render_template_string(ROUTE_TEMPLATE, active_page='routes')
+
+
 @app.route('/maps/<path:filename>')
 def serve_map(filename):
     return send_from_directory(MAP_OUTPUT_DIR, filename)
@@ -856,6 +1565,50 @@ def serve_map(filename):
 @app.route('/analysis_maps/<path:filename>')
 def serve_analysis_map(filename):
     return send_from_directory(ANALYSIS_MAP_DIR, filename)
+
+
+@app.route('/api/shenzhen-boundary')
+def api_shenzhen_boundary():
+    try:
+        return jsonify(_load_shenzhen_boundary())
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/api/routes', methods=['POST'])
+def api_routes():
+    try:
+        payload = request.get_json(silent=True) or {}
+        origin = payload.get('origin') or {}
+        destination = payload.get('destination') or {}
+
+        origin_lon = float(origin['lon'])
+        origin_lat = float(origin['lat'])
+        destination_lon = float(destination['lon'])
+        destination_lat = float(destination['lat'])
+
+        if not (22.35 <= origin_lat <= 22.95 and 113.70 <= origin_lon <= 114.75):
+            raise ValueError('起点超出深圳路网范围')
+        if not (22.35 <= destination_lat <= 22.95 and 113.70 <= destination_lon <= 114.75):
+            raise ValueError('终点超出深圳路网范围')
+
+        result = _compute_stage7_routes(
+            origin_lon, origin_lat,
+            destination_lon, destination_lat,
+        )
+
+        return jsonify({
+            'shortest': result['shortest']['geojson'],
+            'fastest': result['fastest']['geojson'],
+            'summary': result['summary'],
+            'connectors': result['connectors'],
+        })
+    except KeyError:
+        return jsonify({'error': '请求缺少 origin/destination 坐标字段'}), 400
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
 
 
 @app.route('/api/vehicle_trajectory')
