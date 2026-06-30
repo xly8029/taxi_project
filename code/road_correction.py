@@ -29,6 +29,21 @@ from shapely.geometry import LineString, Point
 from shapely.geometry import box
 from shapely.ops import substring
 
+from road_correction_cache import (
+    build_cache_slice_key,
+    build_correction_cache_key,
+    cache_file_exists,
+    cache_mode_token,
+    correction_cache_path,
+    get_single_day_window,
+    is_full_day_range,
+    load_correction_cache,
+    load_vehicle_cache_store,
+    normalize_cache_time,
+    slice_cached_result_by_time_range,
+    write_correction_cache,
+)
+
 # ========================= 配置区 =========================
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROAD_NETWORK_DIR = os.path.join(PROJECT_ROOT, "data", "raw")
@@ -90,158 +105,87 @@ def _vehicle_cache_file(vehicle_id):
     return os.path.join(PROJECT_ROOT, "data", "cache", "vehicle", f"{vehicle_id}.csv")
 
 
+def _network_cache_paths():
+    return [PKL_PATH, GRAPHML_PATH]
+
+
 def _normalize_cache_time(value):
-    if value is None or value == "":
-        return None
-    return str(pd.to_datetime(value))
-
-
-def _safe_time_token(value):
-    normalized = _normalize_cache_time(value)
-    if normalized is None:
-        return "full"
-    return normalized.replace(":", "-").replace(" ", "_")
+    return normalize_cache_time(value)
 
 
 def _cache_mode_token(kwargs):
-    return "undirected" if kwargs.get("use_undirected") else "directed"
+    return cache_mode_token(kwargs)
 
 
 def _is_full_day_range(start_time, end_time):
-    start_norm = _normalize_cache_time(start_time)
-    end_norm = _normalize_cache_time(end_time)
-    if not start_norm or not end_norm:
-        return False
-
-    start_ts = pd.to_datetime(start_norm)
-    end_ts = pd.to_datetime(end_norm)
-    return (
-        start_ts.strftime("%H:%M:%S") == "00:00:00" and
-        end_ts == start_ts.normalize() + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-    )
+    return is_full_day_range(start_time, end_time)
 
 
 def _get_single_day_window(start_time, end_time):
-    if not start_time or not end_time:
-        return None
-    start_ts = pd.to_datetime(start_time)
-    end_ts = pd.to_datetime(end_time)
-    if start_ts.normalize() != end_ts.normalize():
-        return None
-    day_ts = start_ts.normalize()
-    return {
-        "day": day_ts.strftime("%Y-%m-%d"),
-        "full_start": day_ts.strftime("%Y-%m-%d 00:00:00"),
-        "full_end": (day_ts + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
-
-def _serialize_cache_kwargs(kwargs):
-    normalized = {}
-    for key, value in sorted(kwargs.items()):
-        if isinstance(value, (str, int, float, bool)) or value is None:
-            normalized[key] = value
-        else:
-            normalized[key] = repr(value)
-    return normalized
+    return get_single_day_window(start_time, end_time)
 
 
 def _build_correction_cache_key(vehicle_id, start_time=None, end_time=None, **kwargs):
-    vehicle_cache_file = _vehicle_cache_file(vehicle_id)
-    if not os.path.exists(vehicle_cache_file):
-        raise FileNotFoundError(f"车辆 {vehicle_id} 的缓存文件不存在")
-
-    payload = {
-        "vehicle_id": vehicle_id,
-        "vehicle_cache_mtime": os.path.getmtime(vehicle_cache_file),
-        "vehicle_cache_size": os.path.getsize(vehicle_cache_file),
-        "network_mtime": os.path.getmtime(PKL_PATH) if os.path.exists(PKL_PATH) else (
-            os.path.getmtime(GRAPHML_PATH) if os.path.exists(GRAPHML_PATH) else None
-        ),
-        "start_time": _normalize_cache_time(start_time),
-        "end_time": _normalize_cache_time(end_time),
-        "kwargs": _serialize_cache_kwargs(kwargs),
-        "version": ALGO_VERSION,
-    }
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    return hashlib.sha1(raw).hexdigest()
+    return build_correction_cache_key(
+        vehicle_id,
+        start_time,
+        end_time,
+        vehicle_cache_file=_vehicle_cache_file(vehicle_id),
+        network_paths=_network_cache_paths(),
+        algo_version=ALGO_VERSION,
+        kwargs=kwargs,
+    )
 
 
 def _correction_cache_path(vehicle_id):
-    return os.path.join(CORRECTION_CACHE_DIR, f"{vehicle_id}.pkl")
+    return correction_cache_path(CORRECTION_CACHE_DIR, vehicle_id)
 
 
 def _build_cache_slice_key(start_time=None, end_time=None):
-    return f"{_safe_time_token(start_time)}__to__{_safe_time_token(end_time)}"
-
-
-def _normalize_cache_store(store):
-    if not isinstance(store, dict):
-        return {"entries": {}}
-    entries = store.get("entries")
-    if not isinstance(entries, dict):
-        entries = {}
-    store["entries"] = entries
-    return store
+    return build_cache_slice_key(start_time, end_time)
 
 
 def _load_vehicle_cache_store(vehicle_id):
-    cache_path = _correction_cache_path(vehicle_id)
-    if not os.path.exists(cache_path):
-        return {"entries": {}}, cache_path
-    try:
-        with open(cache_path, "rb") as f:
-            return _normalize_cache_store(pickle.load(f)), cache_path
-    except Exception as exc:
-        logger.warning("校正缓存读取失败，准备重算 | %s | %s", os.path.basename(cache_path), exc)
-        return {"entries": {}}, cache_path
-
-
-def _write_vehicle_cache_store(vehicle_id, store):
-    os.makedirs(CORRECTION_CACHE_DIR, exist_ok=True)
-    cache_path = _correction_cache_path(vehicle_id)
-    with open(cache_path, "wb") as f:
-        pickle.dump(_normalize_cache_store(store), f, protocol=pickle.HIGHEST_PROTOCOL)
-    return cache_path
+    return load_vehicle_cache_store(CORRECTION_CACHE_DIR, vehicle_id, logger)
 
 
 def _load_correction_cache(cache_key, vehicle_id=None, start_time=None, end_time=None, **kwargs):
-    if vehicle_id is None:
-        return None
-    store, _ = _load_vehicle_cache_store(vehicle_id)
-    return store.get("entries", {}).get(cache_key)
+    return load_correction_cache(CORRECTION_CACHE_DIR, cache_key, vehicle_id=vehicle_id, logger=logger)
 
 
 def _write_correction_cache(cache_key, result, vehicle_id=None, start_time=None, end_time=None, **kwargs):
-    try:
-        if vehicle_id is None:
-            return
-        store, _ = _load_vehicle_cache_store(vehicle_id)
-        store["entries"][cache_key] = result
-        store["meta"] = {
-            "vehicle_id": vehicle_id,
-            "algo_version": ALGO_VERSION,
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-        }
-        _write_vehicle_cache_store(vehicle_id, store)
-    except Exception as exc:
-        logger.warning("校正缓存写入失败，不影响本次结果 | %s", exc)
+    return write_correction_cache(
+        CORRECTION_CACHE_DIR,
+        cache_key,
+        result,
+        vehicle_id=vehicle_id,
+        algo_version=ALGO_VERSION,
+        logger=logger,
+    )
 
 
 def _cache_file_exists(vehicle_id, start_time=None, end_time=None, **kwargs):
-    cache_key = _build_correction_cache_key(vehicle_id, start_time, end_time, **kwargs)
-    store, cache_path = _load_vehicle_cache_store(vehicle_id)
-    return cache_key in store.get("entries", {}), cache_path, cache_key
+    return cache_file_exists(
+        CORRECTION_CACHE_DIR,
+        vehicle_id,
+        start_time,
+        end_time,
+        vehicle_cache_file=_vehicle_cache_file(vehicle_id),
+        network_paths=_network_cache_paths(),
+        algo_version=ALGO_VERSION,
+        logger=logger,
+        kwargs=kwargs,
+    )
 
 
-def _build_full_day_cache_key(vehicle_id, day, **kwargs):
-    window = _get_single_day_window(f"{day} 00:00:00", f"{day} 23:59:59")
-    return _build_correction_cache_key(vehicle_id, window["full_start"], window["full_end"], **kwargs)
-
-
-def _get_full_day_result_from_store(store, vehicle_id, day, **kwargs):
-    full_key = _build_full_day_cache_key(vehicle_id, day, **kwargs)
-    return store.get("entries", {}).get(full_key), full_key
+def _slice_cached_result_by_time_range(result, df, start_time=None, end_time=None):
+    return slice_cached_result_by_time_range(
+        result,
+        df,
+        start_time,
+        end_time,
+        rebuild_coords_fn=_rebuild_coords_from_timed_pieces,
+    )
 
 
 def _prepare_cached_result(result, df, vehicle_id, source, load_sec, cache_hit):
@@ -275,71 +219,6 @@ def _rebuild_coords_from_timed_pieces(timed_pieces):
 
     _flush_segment()
     return corrected_coords, corrected_segments
-
-
-def _slice_timed_pieces_by_range(timed_pieces, start_time=None, end_time=None):
-    start_ts = pd.to_datetime(start_time) if start_time else None
-    end_ts = pd.to_datetime(end_time) if end_time else None
-    selected = []
-    for piece in timed_pieces:
-        piece_start = pd.to_datetime(piece["start_time"]) if piece.get("start_time") is not None else None
-        piece_end = pd.to_datetime(piece["end_time"]) if piece.get("end_time") is not None else None
-
-        if start_ts is not None and piece_end is not None and piece_end < start_ts:
-            continue
-        if end_ts is not None and piece_start is not None and piece_start > end_ts:
-            continue
-        selected.append(piece)
-    return selected
-
-
-def _slice_debug_segments_by_range(debug_segments, start_time=None, end_time=None):
-    start_ts = pd.to_datetime(start_time) if start_time else None
-    end_ts = pd.to_datetime(end_time) if end_time else None
-    selected = []
-    for segment in debug_segments:
-        seg_start = pd.to_datetime(segment.get("start_time")) if segment.get("start_time") is not None else None
-        seg_end = pd.to_datetime(segment.get("end_time")) if segment.get("end_time") is not None else None
-
-        if start_ts is not None and seg_end is not None and seg_end < start_ts:
-            continue
-        if end_ts is not None and seg_start is not None and seg_start > end_ts:
-            continue
-        selected.append(segment)
-    return selected
-
-
-
-
-def _slice_cached_result_by_time_range(result, df, start_time=None, end_time=None):
-    sliced = dict(result)
-    timed_pieces = result.get("timed_pieces") or []
-    if timed_pieces:
-        selected_pieces = _slice_timed_pieces_by_range(timed_pieces, start_time, end_time)
-        corrected_coords, corrected_segments = _rebuild_coords_from_timed_pieces(selected_pieces)
-        sliced["timed_pieces"] = selected_pieces
-        sliced["corrected_coords"] = corrected_coords
-        sliced["corrected_segments"] = corrected_segments
-
-    sliced_debug = _slice_debug_segments_by_range(result.get("debug_segments", []), start_time, end_time)
-    sliced["debug_segments"] = sliced_debug
-    sliced["original_coords"] = df[["lati", "long"]].values.tolist()
-    return sliced
-
-
-def _load_full_day_cache_for_range(vehicle_id, start_time=None, end_time=None, **kwargs):
-    if not start_time or not end_time:
-        return None, None, None
-
-    start_ts = pd.to_datetime(start_time)
-    end_ts = pd.to_datetime(end_time)
-    if start_ts.normalize() != end_ts.normalize():
-        return None, None, None
-
-    day = start_ts.strftime("%Y-%m-%d")
-    store, _ = _load_vehicle_cache_store(vehicle_id)
-    cached, full_key = _get_full_day_result_from_store(store, vehicle_id, day, **kwargs)
-    return cached, day, full_key
 
 
 def _setup_logger():
@@ -2044,6 +1923,8 @@ def warmup_all_vehicle_day_caches(day, limit=None, skip_existing=True, **kwargs)
 
 
 def _parse_cli_args(argv):
+    if len(argv) < 2:
+        return {"command": "help"}
     if len(argv) >= 2 and argv[1] == "warmup-day":
         if len(argv) < 4:
             raise ValueError("用法: python code/road_correction.py warmup-day <vehicle_id> <YYYY-MM-DD> [--use-undirected]")
@@ -2073,7 +1954,14 @@ def _parse_cli_args(argv):
             "limit": limit,
             "skip_existing": skip_existing,
         }
-    return {"command": "sample"}
+    if argv[1] == "sample":
+        return {"command": "sample"}
+    raise ValueError(
+        "用法:\n"
+        "  python code/road_correction.py sample\n"
+        "  python code/road_correction.py warmup-day <vehicle_id> <YYYY-MM-DD> [--use-undirected]\n"
+        "  python code/road_correction.py warmup-all-day <YYYY-MM-DD> [--use-undirected] [--limit N] [--force]"
+    )
 
 
 def run_sample_correction():
@@ -2132,7 +2020,14 @@ def run_sample_correction():
 
 if __name__ == "__main__":
     cli_args = _parse_cli_args(sys.argv)
-    if cli_args["command"] == "warmup-day":
+    if cli_args["command"] == "help":
+        print(
+            "用法:\n"
+            "  python code/road_correction.py sample\n"
+            "  python code/road_correction.py warmup-day <vehicle_id> <YYYY-MM-DD> [--use-undirected]\n"
+            "  python code/road_correction.py warmup-all-day <YYYY-MM-DD> [--use-undirected] [--limit N] [--force]"
+        )
+    elif cli_args["command"] == "warmup-day":
         summary = warmup_vehicle_correction_cache(
             cli_args["vehicle_id"],
             cli_args["day"],
@@ -2147,5 +2042,5 @@ if __name__ == "__main__":
             use_undirected=cli_args["use_undirected"],
         )
         print(json.dumps(summary, ensure_ascii=False, indent=2))
-    else:
+    elif cli_args["command"] == "sample":
         run_sample_correction()
