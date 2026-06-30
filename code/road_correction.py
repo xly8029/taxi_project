@@ -433,6 +433,22 @@ def _geometry_to_latlngs(geometry):
     return [[lat, lng] for lng, lat in coords]
 
 
+def _orient_coords_from_start(segment_coords, expected_start):
+    """按期望起点统一坐标方向，避免弯道片段被反向后出现跨段直线。"""
+    if not segment_coords or expected_start is None:
+        return segment_coords
+
+    start_dist = _haversine_meters(
+        segment_coords[0][0], segment_coords[0][1], expected_start[0], expected_start[1]
+    )
+    end_dist = _haversine_meters(
+        segment_coords[-1][0], segment_coords[-1][1], expected_start[0], expected_start[1]
+    )
+    if end_dist < start_dist:
+        segment_coords.reverse()
+    return segment_coords
+
+
 def _best_edge_geometry_between_nodes(G, u, v):
     """在多重边中选择最短的那条边几何。"""
     edge_bundle = G.get_edge_data(u, v)
@@ -509,11 +525,13 @@ def _edge_segment_to_coords(G, edge, start_progress, end_progress):
     if not segment_coords:
         return []
 
-    u_coord = _node_lat_lng(G, u)
-    if _haversine_meters(segment_coords[0][0], segment_coords[0][1], u_coord[0], u_coord[1]) > \
-            _haversine_meters(segment_coords[-1][0], segment_coords[-1][1], u_coord[0], u_coord[1]):
-        segment_coords.reverse()
-    return segment_coords
+    expected_start = segment_coords[0]
+    if start_progress is not None:
+        start_geometry = _slice_edge_geometry_by_progress(G, u, v, key, start_progress, start_progress)
+        start_coords = _geometry_to_latlngs(start_geometry)
+        if start_coords:
+            expected_start = start_coords[0]
+    return _orient_coords_from_start(segment_coords, expected_start)
 
 
 def _route_to_geometry_coords(G, path, start_snap=None, end_snap=None, route_edges=None,
@@ -571,10 +589,11 @@ def _route_to_geometry_coords(G, path, start_snap=None, end_snap=None, route_edg
                 geometry = _edge_geometry(G, u, v, key) if key is not None else _best_edge_geometry_between_nodes(G, u, v)
             segment_coords = _geometry_to_latlngs(geometry)
             if segment_coords:
-                u_coord = _node_lat_lng(G, u)
-                if _haversine_meters(segment_coords[0][0], segment_coords[0][1], u_coord[0], u_coord[1]) > \
-                        _haversine_meters(segment_coords[-1][0], segment_coords[-1][1], u_coord[0], u_coord[1]):
-                    segment_coords.reverse()
+                if idx == 0 and start_snap is not None:
+                    expected_start = start_snap
+                else:
+                    expected_start = _node_lat_lng(G, u)
+                segment_coords = _orient_coords_from_start(segment_coords, expected_start)
                 for coord in segment_coords:
                     _append_coord(coords, coord)
 
