@@ -103,6 +103,10 @@ def _safe_time_token(value):
     return normalized.replace(":", "-").replace(" ", "_")
 
 
+def _cache_mode_token(kwargs):
+    return "undirected" if kwargs.get("use_undirected") else "directed"
+
+
 def _is_full_day_range(start_time, end_time):
     start_norm = _normalize_cache_time(start_time)
     end_norm = _normalize_cache_time(end_time)
@@ -115,6 +119,21 @@ def _is_full_day_range(start_time, end_time):
         start_ts.strftime("%H:%M:%S") == "00:00:00" and
         end_ts == start_ts.normalize() + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
     )
+
+
+def _get_single_day_window(start_time, end_time):
+    if not start_time or not end_time:
+        return None
+    start_ts = pd.to_datetime(start_time)
+    end_ts = pd.to_datetime(end_time)
+    if start_ts.normalize() != end_ts.normalize():
+        return None
+    day_ts = start_ts.normalize()
+    return {
+        "day": day_ts.strftime("%Y-%m-%d"),
+        "full_start": day_ts.strftime("%Y-%m-%d 00:00:00"),
+        "full_end": (day_ts + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S"),
+    }
 
 
 def _serialize_cache_kwargs(kwargs):
@@ -133,66 +152,96 @@ def _build_correction_cache_key(vehicle_id, start_time=None, end_time=None, **kw
         raise FileNotFoundError(f"车辆 {vehicle_id} 的缓存文件不存在")
 
     payload = {
-        "vehicle_id": int(vehicle_id),
-        "start_time": _normalize_cache_time(start_time),
-        "end_time": _normalize_cache_time(end_time),
-        "kwargs": _serialize_cache_kwargs(kwargs),
+        "vehicle_id": vehicle_id,
         "vehicle_cache_mtime": os.path.getmtime(vehicle_cache_file),
         "vehicle_cache_size": os.path.getsize(vehicle_cache_file),
         "network_mtime": os.path.getmtime(PKL_PATH) if os.path.exists(PKL_PATH) else (
             os.path.getmtime(GRAPHML_PATH) if os.path.exists(GRAPHML_PATH) else None
         ),
-        "version": 1,
+        "start_time": _normalize_cache_time(start_time),
+        "end_time": _normalize_cache_time(end_time),
+        "kwargs": _serialize_cache_kwargs(kwargs),
+        "version": ALGO_VERSION,
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return hashlib.sha1(raw).hexdigest()
 
 
-def _build_correction_cache_name(vehicle_id, start_time=None, end_time=None, **kwargs):
-    mode = "undirected" if kwargs.get("use_undirected") else "directed"
-    if _is_full_day_range(start_time, end_time):
-        day = pd.to_datetime(start_time).strftime("%Y-%m-%d")
-        return f"{vehicle_id}__{day}__full_day__{mode}.pkl"
-
-    start_token = _safe_time_token(start_time)
-    end_token = _safe_time_token(end_time)
-    return f"{vehicle_id}__{start_token}__to__{end_token}__{mode}.pkl"
+def _correction_cache_path(vehicle_id):
+    return os.path.join(CORRECTION_CACHE_DIR, f"{vehicle_id}.pkl")
 
 
-def _correction_cache_path(cache_key, vehicle_id=None, start_time=None, end_time=None, **kwargs):
-    if vehicle_id is not None:
-        file_name = _build_correction_cache_name(vehicle_id, start_time, end_time, **kwargs)
-    else:
-        file_name = f"{cache_key}.pkl"
-    return os.path.join(CORRECTION_CACHE_DIR, file_name)
+def _build_cache_slice_key(start_time=None, end_time=None):
+    return f"{_safe_time_token(start_time)}__to__{_safe_time_token(end_time)}"
+
+
+def _normalize_cache_store(store):
+    if not isinstance(store, dict):
+        return {"entries": {}}
+    entries = store.get("entries")
+    if not isinstance(entries, dict):
+        entries = {}
+    store["entries"] = entries
+    return store
+
+
+def _load_vehicle_cache_store(vehicle_id):
+    cache_path = _correction_cache_path(vehicle_id)
+    if not os.path.exists(cache_path):
+        return {"entries": {}}, cache_path
+    try:
+        with open(cache_path, "rb") as f:
+            return _normalize_cache_store(pickle.load(f)), cache_path
+    except Exception as exc:
+        logger.warning("校正缓存读取失败，准备重算 | %s | %s", os.path.basename(cache_path), exc)
+        return {"entries": {}}, cache_path
+
+
+def _write_vehicle_cache_store(vehicle_id, store):
+    os.makedirs(CORRECTION_CACHE_DIR, exist_ok=True)
+    cache_path = _correction_cache_path(vehicle_id)
+    with open(cache_path, "wb") as f:
+        pickle.dump(_normalize_cache_store(store), f, protocol=pickle.HIGHEST_PROTOCOL)
+    return cache_path
 
 
 def _load_correction_cache(cache_key, vehicle_id=None, start_time=None, end_time=None, **kwargs):
-    cache_path = _correction_cache_path(cache_key, vehicle_id, start_time, end_time, **kwargs)
-    if not os.path.exists(cache_path):
+    if vehicle_id is None:
         return None
-    try:
-        with open(cache_path, "rb") as f:
-            return pickle.load(f)
-    except Exception as exc:
-        logger.warning("校正缓存读取失败，准备重算 | %s | %s", os.path.basename(cache_path), exc)
-        return None
+    store, _ = _load_vehicle_cache_store(vehicle_id)
+    return store.get("entries", {}).get(cache_key)
 
 
 def _write_correction_cache(cache_key, result, vehicle_id=None, start_time=None, end_time=None, **kwargs):
-    os.makedirs(CORRECTION_CACHE_DIR, exist_ok=True)
-    cache_path = _correction_cache_path(cache_key, vehicle_id, start_time, end_time, **kwargs)
     try:
-        with open(cache_path, "wb") as f:
-            pickle.dump(result, f, protocol=pickle.HIGHEST_PROTOCOL)
+        if vehicle_id is None:
+            return
+        store, _ = _load_vehicle_cache_store(vehicle_id)
+        store["entries"][cache_key] = result
+        store["meta"] = {
+            "vehicle_id": vehicle_id,
+            "algo_version": ALGO_VERSION,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        _write_vehicle_cache_store(vehicle_id, store)
     except Exception as exc:
         logger.warning("校正缓存写入失败，不影响本次结果 | %s", exc)
 
 
 def _cache_file_exists(vehicle_id, start_time=None, end_time=None, **kwargs):
     cache_key = _build_correction_cache_key(vehicle_id, start_time, end_time, **kwargs)
-    cache_path = _correction_cache_path(cache_key, vehicle_id, start_time, end_time, **kwargs)
-    return os.path.exists(cache_path), cache_path, cache_key
+    store, cache_path = _load_vehicle_cache_store(vehicle_id)
+    return cache_key in store.get("entries", {}), cache_path, cache_key
+
+
+def _build_full_day_cache_key(vehicle_id, day, **kwargs):
+    window = _get_single_day_window(f"{day} 00:00:00", f"{day} 23:59:59")
+    return _build_correction_cache_key(vehicle_id, window["full_start"], window["full_end"], **kwargs)
+
+
+def _get_full_day_result_from_store(store, vehicle_id, day, **kwargs):
+    full_key = _build_full_day_cache_key(vehicle_id, day, **kwargs)
+    return store.get("entries", {}).get(full_key), full_key
 
 
 def _prepare_cached_result(result, df, vehicle_id, source, load_sec, cache_hit):
@@ -287,17 +336,10 @@ def _load_full_day_cache_for_range(vehicle_id, start_time=None, end_time=None, *
     if start_ts.normalize() != end_ts.normalize():
         return None, None, None
 
-    full_start = start_ts.strftime("%Y-%m-%d 00:00:00")
-    full_end = (start_ts.normalize() + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
-    full_key = _build_correction_cache_key(vehicle_id, full_start, full_end, **kwargs)
-    cached = _load_correction_cache(
-        full_key,
-        vehicle_id=vehicle_id,
-        start_time=full_start,
-        end_time=full_end,
-        **kwargs,
-    )
-    return cached, full_start, full_end
+    day = start_ts.strftime("%Y-%m-%d")
+    store, _ = _load_vehicle_cache_store(vehicle_id)
+    cached, full_key = _get_full_day_result_from_store(store, vehicle_id, day, **kwargs)
+    return cached, day, full_key
 
 
 def _setup_logger():
@@ -1814,74 +1856,113 @@ def correct_trajectory(df, G=None, use_undirected=False,
         "timed_pieces": timed_pieces,
     }
 
+# ========================= 算法版本自动指纹 =========================
+# 缓存命中与否取决于这些函数的源码内容：只要其中任何一个函数的逻辑被
+# 修改（哪怕只改一行），ALGO_VERSION 就会自动变化，旧缓存文件名不再
+# 匹配，自然不会被命中，也不需要手动维护一个数字版本号去记"改到第几版了"。
+_ALGO_FINGERPRINT_FUNCS = [
+    _choose_best_route,
+    _viterbi_match_candidates,
+    _route_to_geometry_coords,
+    _snap_gps_point_to_edge,
+    _build_candidates_for_point,
+    correct_trajectory,
+]
+
+
+def _compute_algo_version():
+    import inspect
+    source_blob = "".join(inspect.getsource(fn) for fn in _ALGO_FINGERPRINT_FUNCS)
+    return hashlib.sha1(source_blob.encode("utf-8")).hexdigest()[:10]
+
+
+ALGO_VERSION = _compute_algo_version()
 
 def correct_vehicle_trajectory(vehicle_id, start_time=None, end_time=None, **kwargs):
     """从车辆缓存读取轨迹并校正。"""
     from map_visualization import load_vehicle_trajectory
 
-    df = load_vehicle_trajectory(vehicle_id, start_time, end_time)
-    if df.empty:
+    requested_start = start_time
+    requested_end = end_time
+    requested_df = load_vehicle_trajectory(vehicle_id, requested_start, requested_end)
+    if requested_df.empty:
         raise ValueError(f"车辆 {vehicle_id} 在指定时间段内无数据")
 
-    cache_key = _build_correction_cache_key(vehicle_id, start_time, end_time, **kwargs)
+    day_window = _get_single_day_window(start_time, end_time)
+    query_start = start_time
+    query_end = end_time
+    if day_window is not None and not _is_full_day_range(start_time, end_time):
+        query_start = day_window["full_start"]
+        query_end = day_window["full_end"]
+
+    df = requested_df if (query_start == requested_start and query_end == requested_end) else load_vehicle_trajectory(vehicle_id, query_start, query_end)
+
+    cache_key = _build_correction_cache_key(vehicle_id, query_start, query_end, **kwargs)
+    cache_path = _correction_cache_path(vehicle_id)
     cached_result = _load_correction_cache(
         cache_key,
         vehicle_id=vehicle_id,
-        start_time=start_time,
-        end_time=end_time,
+        start_time=query_start,
+        end_time=query_end,
         **kwargs,
     )
     G, source, load_sec = load_road_network()
     if cached_result is not None:
+        result_to_return = cached_result
+        response_df = df
+        if day_window is not None and not _is_full_day_range(requested_start, requested_end):
+            result_to_return = _slice_cached_result_by_time_range(cached_result, requested_df, requested_start, requested_end)
+            result_to_return["cache_source"] = {
+                "type": "vehicle_day_slice",
+                "day": day_window["day"],
+                "slice_key": _build_cache_slice_key(requested_start, requested_end),
+                "mode": _cache_mode_token(kwargs),
+            }
+            response_df = requested_df
         logger.info(
             "命中轨迹校正缓存 | vehicle=%s | %s -> %s | file=%s",
             vehicle_id,
-            _normalize_cache_time(start_time),
-            _normalize_cache_time(end_time),
-            os.path.basename(_correction_cache_path(cache_key, vehicle_id, start_time, end_time, **kwargs)),
+            _normalize_cache_time(query_start),
+            _normalize_cache_time(query_end),
+            os.path.basename(cache_path),
         )
-        return _prepare_cached_result(cached_result, df, vehicle_id, source, load_sec, cache_hit=True)
-
-    full_day_cached, full_start, full_end = _load_full_day_cache_for_range(
-        vehicle_id,
-        start_time=start_time,
-        end_time=end_time,
-        **kwargs,
-    )
-    if full_day_cached is not None:
-        logger.info(
-            "命中整天校正缓存并切片 | vehicle=%s | query=%s -> %s | source=%s",
-            vehicle_id,
-            _normalize_cache_time(start_time),
-            _normalize_cache_time(end_time),
-            os.path.basename(_correction_cache_path(
-                _build_correction_cache_key(vehicle_id, full_start, full_end, **kwargs),
-                vehicle_id,
-                full_start,
-                full_end,
-                **kwargs,
-            )),
-        )
-        sliced_result = _slice_cached_result_by_time_range(full_day_cached, df, start_time, end_time)
-        return _prepare_cached_result(sliced_result, df, vehicle_id, source, load_sec, cache_hit=True)
+        return _prepare_cached_result(result_to_return, response_df, vehicle_id, source, load_sec, cache_hit=True)
 
     result = correct_trajectory(df, G=G, **kwargs)
+    result["cache_source"] = {
+        "type": "vehicle_day" if day_window is not None else "exact_range",
+        "day": day_window["day"] if day_window is not None else None,
+        "slice_key": _build_cache_slice_key(query_start, query_end),
+        "mode": _cache_mode_token(kwargs),
+    }
     _write_correction_cache(
         cache_key,
         result,
         vehicle_id=vehicle_id,
-        start_time=start_time,
-        end_time=end_time,
+        start_time=query_start,
+        end_time=query_end,
         **kwargs,
     )
     logger.info(
         "写入轨迹校正缓存 | vehicle=%s | %s -> %s | file=%s",
         vehicle_id,
-        _normalize_cache_time(start_time),
-        _normalize_cache_time(end_time),
-        os.path.basename(_correction_cache_path(cache_key, vehicle_id, start_time, end_time, **kwargs)),
+        _normalize_cache_time(query_start),
+        _normalize_cache_time(query_end),
+        os.path.basename(cache_path),
     )
-    return _prepare_cached_result(result, df, vehicle_id, source, load_sec, cache_hit=False)
+
+    result_to_return = result
+    response_df = df
+    if day_window is not None and not _is_full_day_range(requested_start, requested_end):
+        result_to_return = _slice_cached_result_by_time_range(result, requested_df, requested_start, requested_end)
+        result_to_return["cache_source"] = {
+            "type": "vehicle_day_slice",
+            "day": day_window["day"],
+            "slice_key": _build_cache_slice_key(requested_start, requested_end),
+            "mode": _cache_mode_token(kwargs),
+        }
+        response_df = requested_df
+    return _prepare_cached_result(result_to_return, response_df, vehicle_id, source, load_sec, cache_hit=False)
 
 
 def warmup_vehicle_correction_cache(vehicle_id, day, **kwargs):
@@ -1897,13 +1978,7 @@ def warmup_vehicle_correction_cache(vehicle_id, day, **kwargs):
         "end_time": end_time,
         "points": len(result["df"]),
         "cache_hit": bool(result.get("cache_hit")),
-        "cache_file": os.path.basename(_correction_cache_path(
-            _build_correction_cache_key(vehicle_id, start_time, end_time, **kwargs),
-            vehicle_id,
-            start_time,
-            end_time,
-            **kwargs,
-        )),
+        "cache_file": os.path.basename(_correction_cache_path(vehicle_id)),
         "stats": result["stats"],
     }
 
