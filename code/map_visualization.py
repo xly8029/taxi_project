@@ -1050,6 +1050,7 @@ def plot_corrected_trajectory(vehicle_ids, start_time=None, end_time=None,
     all_corrected = []
     all_debug_segments = []
     stats_lines = []
+    cache_lines = []
 
     if enable_correction:
         load_road_network()
@@ -1071,6 +1072,15 @@ def plot_corrected_trajectory(vehicle_ids, start_time=None, end_time=None,
                 f"路段成功 {s['success_segments']}/{s['total_segments']} ({rate:.0f}%), "
                 f"可疑段 {len(debug_segments)}, 低置信降级片段 {degraded}"
             )
+            cache_source = result.get("cache_source") or {}
+            cache_day = cache_source.get("day")
+            cache_label = "缓存命中" if result.get("cache_hit") else "新生成"
+            if cache_source.get("type") == "vehicle_day_slice" and cache_day:
+                cache_lines.append(f"车辆 {vehicle_id}: {cache_label}，来自 {cache_day} 整天缓存，按当前时间片切图")
+            elif cache_day:
+                cache_lines.append(f"车辆 {vehicle_id}: {cache_label}，写入/读取 {cache_day} 整天缓存")
+            else:
+                cache_lines.append(f"车辆 {vehicle_id}: {cache_label}，按当前时间范围缓存")
         else:
             df = load_vehicle_trajectory(vehicle_id, start_time, end_time)
             if df.empty:
@@ -1154,6 +1164,7 @@ def plot_corrected_trajectory(vehicle_ids, start_time=None, end_time=None,
     folium.LayerControl(collapsed=False).add_to(m)
 
     stats_html = "<br>".join(stats_lines) if stats_lines else "未启用路网校正"
+    cache_html = "<br>".join(cache_lines) if cache_lines else ""
     toggle_html = f"""
     <div style="position:fixed; bottom:30px; left:50px; z-index:9999;
                 background:white; border:2px solid #059669; border-radius:10px;
@@ -1168,6 +1179,7 @@ def plot_corrected_trajectory(vehicle_ids, start_time=None, end_time=None,
             橙色/红色虚线 = 回退段、可疑方向段、无向图兜底段
         </div>
         <div style="margin-top:8px; color:#374151; font-size:12px;">{stats_html}</div>
+        <div style="margin-top:8px; color:#0f6cbd; font-size:12px;">{cache_html}</div>
         <div style="margin-top:6px; color:#6b7280; font-size:11px;">
             橙色虚线 = 原始 GPS &nbsp;|&nbsp; 绿色实线 = 路网校正
         </div>
