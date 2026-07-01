@@ -13,8 +13,9 @@ import pickle
 import pandas as pd
 import networkx as nx
 import osmnx as ox
+import geopandas as gpd
 from shapely.geometry import LineString, Point, mapping
-from shapely.ops import substring
+from shapely.ops import substring, unary_union
 from flask import Flask, request, render_template_string, send_from_directory, jsonify
 
 from data_analysis import (
@@ -46,8 +47,12 @@ os.makedirs(ANALYSIS_MAP_DIR, exist_ok=True)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STAGE7_GRAPH_PATH = os.path.join(PROJECT_ROOT, 'data', 'cache', 'shenzhen_drive_stage7.pkl')
 SHENZHEN_BOUNDARY_PATH = os.path.join(PROJECT_ROOT, 'data', 'raw', '深圳市.json')
+STAGE7_OD_PATH = os.path.join(PROJECT_ROOT, 'data', 'cache', 'od', 'od_cache_stage7.parquet')
+STAGE7_TRACK_PATH = os.path.join(PROJECT_ROOT, 'data', 'cache', 'matched_trajectory_stage7.parquet')
+ROAD_CORRECTION_CACHE_DIR = os.path.join(PROJECT_ROOT, 'data', 'cache', 'road_correction')
 _STAGE7_GRAPH = None
 _SHENZHEN_BOUNDARY = None
+_STAGE7_OD = None
 
 
 PAGE_TEMPLATE = """
@@ -71,6 +76,8 @@ PAGE_TEMPLATE = """
     * { box-sizing: border-box; }
     body {
       margin: 0;
+      height: 100vh;
+      overflow: hidden;
       font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
       color: var(--text);
       background: linear-gradient(135deg, #eef4fb 0%, #f8fbff 100%);
@@ -78,7 +85,7 @@ PAGE_TEMPLATE = """
     .layout {
       display: grid;
       grid-template-columns: 360px 1fr;
-      min-height: 100vh;
+      height: 100vh;
     }
     .top-nav {
       display: flex;
@@ -256,6 +263,7 @@ PAGE_TEMPLATE = """
         <a href="/" class="{{ 'active' if active_page == 'map' else '' }}">地图查询</a>
         <a href="/analysis" class="{{ 'active' if active_page == 'analysis' else '' }}">热力图分析</a>
         <a href="/routes" class="{{ 'active' if active_page == 'routes' else '' }}">路线规划</a>
+        <a href="/orders" class="{{ 'active' if active_page == 'orders' else '' }}">订单对比</a>
       </div>
       <h1>出租车地图交互查询</h1>
       <form method="post" class="panel">
@@ -418,11 +426,12 @@ ANALYSIS_TEMPLATE = """
     }
     .sidebar {
       padding: 24px;
+      height: 100vh;
       background: rgba(255, 255, 255, 0.96);
       border-right: 1px solid var(--line);
       overflow-y: auto;
     }
-    .main { padding: 20px; }
+    .main { padding: 20px; height: 100vh; overflow: hidden; }
     .top-nav {
       display: flex;
       gap: 10px;
@@ -544,6 +553,7 @@ ANALYSIS_TEMPLATE = """
         <a href="/">地图查询</a>
         <a href="/analysis" class="active">热力图分析</a>
         <a href="/routes">路线规划</a>
+        <a href="/orders">订单对比</a>
       </div>
       <h1>热力图与统计分析</h1>
       <p class="subtitle">在页面中选择热力图或聚类模式，动态生成阶段05结果，并保留统计表输出位置。</p>
@@ -646,6 +656,8 @@ ROUTE_TEMPLATE = """
     * { box-sizing: border-box; }
     body {
       margin: 0;
+      height: 100vh;
+      overflow: hidden;
       font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
       color: var(--text);
       background: linear-gradient(135deg, #eef4fb 0%, #f8fbff 100%);
@@ -653,7 +665,7 @@ ROUTE_TEMPLATE = """
     .layout {
       display: grid;
       grid-template-columns: 360px 1fr;
-      min-height: 100vh;
+      height: 100vh;
     }
     .top-nav {
       display: flex;
@@ -677,11 +689,12 @@ ROUTE_TEMPLATE = """
     }
     .sidebar {
       padding: 24px;
+      height: 100vh;
       background: rgba(255, 255, 255, 0.96);
       border-right: 1px solid var(--line);
       overflow-y: auto;
     }
-    .main { padding: 20px; }
+    .main { padding: 20px; height: 100vh; overflow: hidden; }
     h1 { font-size: 24px; margin: 0 0 8px; }
     .subtitle {
       font-size: 14px;
@@ -763,6 +776,7 @@ ROUTE_TEMPLATE = """
         <a href="/">地图查询</a>
         <a href="/analysis">热力图分析</a>
         <a href="/routes" class="active">路线规划</a>
+        <a href="/orders">订单对比</a>
       </div>
       <h1>最短与最快路线</h1>
       <p class="subtitle">连续点击地图选择起点和终点。蓝线是最短距离路线，绿线是基准最快路线，灰色虚线用于连接点击位置与吸附到路网后的起终点。</p>
@@ -990,6 +1004,314 @@ ROUTE_TEMPLATE = """
 """
 
 
+ORDER_COMPARE_TEMPLATE = """
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>历史订单三路线对比</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    :root {
+      --bg: #f4f7fb;
+      --panel: #ffffff;
+      --line: #d7e0ea;
+      --text: #1d2a38;
+      --muted: #637487;
+      --accent: #0f6cbd;
+      --accent-dark: #0a4f8a;
+      --danger: #b42318;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; height: 100vh; overflow: hidden; font-family: "Microsoft YaHei", "PingFang SC", sans-serif; color: var(--text); background: linear-gradient(135deg, #eef4fb 0%, #f8fbff 100%); }
+    .layout { display: grid; grid-template-columns: 390px 1fr; height: 100vh; }
+    .top-nav { display: flex; gap: 10px; margin-bottom: 18px; flex-wrap: wrap; }
+    .top-nav a { text-decoration: none; padding: 8px 12px; border-radius: 999px; font-size: 13px; border: 1px solid var(--line); color: var(--text); background: #fff; }
+    .top-nav a.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .sidebar { padding: 24px; height: 100vh; background: rgba(255,255,255,.96); border-right: 1px solid var(--line); overflow-y: auto; }
+    .main { padding: 20px; height: 100vh; overflow: hidden; }
+    h1 { font-size: 24px; margin: 0 0 8px; }
+    .subtitle { font-size: 14px; color: var(--muted); margin: 0 0 20px; line-height: 1.6; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px; margin-bottom: 16px; box-shadow: 0 10px 30px rgba(31, 60, 96, 0.06); }
+    .panel h2 { margin: 0 0 12px; font-size: 16px; }
+    .field { margin-bottom: 12px; }
+    label { display: block; margin-bottom: 6px; font-size: 13px; color: var(--muted); }
+    input, select { width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); font-size: 14px; background: #fff; }
+    button { border: 0; border-radius: 10px; padding: 11px 16px; font-size: 14px; cursor: pointer; background: var(--accent); color: #fff; }
+    button:hover { background: var(--accent-dark); }
+    .tips { font-size: 13px; color: var(--muted); line-height: 1.8; }
+    .status { margin-bottom: 12px; padding: 12px 14px; border-radius: 10px; font-size: 14px; background: #edf7ed; color: #1e6b34; border: 1px solid #cde7d1; }
+    .status.error { background: #fdecec; color: var(--danger); border: 1px solid #f7c5c0; }
+    .results { max-height: 260px; overflow-y: auto; border: 1px solid var(--line); border-radius: 10px; }
+    .result-item { padding: 10px 12px; border-bottom: 1px solid var(--line); cursor: pointer; background: #fff; }
+    .result-item:hover { background: #f7fbff; }
+    .result-item.active { background: #e9f3ff; }
+    .result-title { font-size: 13px; font-weight: 600; }
+    .result-meta { margin-top: 4px; font-size: 12px; color: var(--muted); line-height: 1.6; }
+    .summary-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .metric { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: #fafcff; }
+    .metric .label { font-size: 12px; color: var(--muted); }
+    .metric .value { font-size: 16px; margin-top: 4px; }
+    #compare-map { width: 100%; height: calc(100vh - 40px); background: #fff; border: 1px solid var(--line); border-radius: 16px; overflow: hidden; box-shadow: 0 10px 30px rgba(31, 60, 96, 0.06); }
+    .legend-row { display:flex; align-items:center; gap:8px; margin-top:8px; font-size:13px; }
+    .legend-line { width:30px; height:4px; border-radius:99px; }
+    @media (max-width: 1100px) { .layout { grid-template-columns: 1fr; } #compare-map { height: 72vh; } }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="top-nav">
+        <a href="/">地图查询</a>
+        <a href="/analysis">热力图分析</a>
+        <a href="/routes">路线规划</a>
+        <a href="/orders" class="active">订单对比</a>
+      </div>
+      <h1>历史订单三路线对比</h1>
+      <p class="subtitle">直接读取阶段 07 的校正 OD 缓存和校正轨迹缓存，对同一订单叠加展示历史实际路线、最短距离路线、基准最快路线。</p>
+
+      <div class="panel">
+        <h2>订单筛选</h2>
+        <div class="field">
+          <label for="vehicle-id">车辆 ID</label>
+          <input id="vehicle-id" value="22223" placeholder="例如 22223，可为空">
+        </div>
+        <div class="field">
+          <label for="date-filter">日期</label>
+          <input id="date-filter" value="2013-10-22" placeholder="2013-10-22">
+        </div>
+        <div class="field">
+          <label for="start-filter">开始时间下限</label>
+          <input id="start-filter" value="2013-10-22 08:00:00" placeholder="2013-10-22 08:00:00，可为空">
+        </div>
+        <div class="field">
+          <label for="end-filter">开始时间上限</label>
+          <input id="end-filter" value="2013-10-22 10:00:00" placeholder="2013-10-22 10:00:00，可为空">
+        </div>
+        <div class="field">
+          <label for="limit-filter">返回数量</label>
+          <input id="limit-filter" value="20">
+        </div>
+        <button type="button" onclick="loadOrders()">查询订单</button>
+      </div>
+
+      <div id="orders-status" class="status">点击“查询订单”加载候选订单。</div>
+
+      <div class="panel">
+        <h2>候选订单</h2>
+        <div id="orders-empty" class="tips">当前还没有查询结果。</div>
+        <div id="orders-list" class="results" style="display:none;"></div>
+      </div>
+
+      <div class="panel">
+        <h2>路线图例</h2>
+        <div class="legend-row"><span class="legend-line" style="background:blue;"></span><span>最短距离路线</span></div>
+        <div class="legend-row"><span class="legend-line" style="background:green;"></span><span>基准最快路线</span></div>
+        <div class="legend-row"><span class="legend-line" style="background:red;"></span><span>历史实际路线</span></div>
+        <div class="legend-row"><span class="legend-line" style="background:#123b7a;"></span><span>深圳行政边界</span></div>
+      </div>
+
+      <div class="panel">
+        <h2>指标摘要</h2>
+        <div id="compare-empty" class="tips">选择订单后显示三路线对比指标。</div>
+        <div id="compare-summary" style="display:none;">
+          <div class="summary-grid">
+            <div class="metric"><div class="label">实际距离</div><div class="value" id="m-actual-distance">-</div></div>
+            <div class="metric"><div class="label">实际耗时</div><div class="value" id="m-actual-duration">-</div></div>
+            <div class="metric"><div class="label">最短距离</div><div class="value" id="m-shortest-distance">-</div></div>
+            <div class="metric"><div class="label">最快路线距离</div><div class="value" id="m-fastest-distance">-</div></div>
+            <div class="metric"><div class="label">距离差</div><div class="value" id="m-gap">-</div></div>
+            <div class="metric"><div class="label">绕行比例</div><div class="value" id="m-detour">-</div></div>
+            <div class="metric"><div class="label">与最短路线重合率</div><div class="value" id="m-shortest-overlap">-</div></div>
+            <div class="metric"><div class="label">与最快路线重合率</div><div class="value" id="m-fastest-overlap">-</div></div>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div id="compare-map"></div>
+    </main>
+  </div>
+
+  <script>
+    const compareMap = L.map('compare-map').setView([22.58, 114.08], 11);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap' }).addTo(compareMap);
+
+    const compareState = {
+      boundary: null,
+      orderItems: [],
+      activeOrderIndex: null,
+      shortestLayer: null,
+      fastestLayer: null,
+      actualLayer: null,
+      endpointMarkers: [],
+      requestSeq: 0,
+    };
+
+    function compareStatus(text, isError=false) {
+      const box = document.getElementById('orders-status');
+      box.textContent = text;
+      box.className = isError ? 'status error' : 'status';
+    }
+
+    function fmtDistance(m) {
+      if (m === null || m === undefined) return '不可用';
+      return m >= 1000 ? (m / 1000).toFixed(2) + ' km' : Math.round(m) + ' m';
+    }
+
+    function fmtDuration(s) {
+      if (s === null || s === undefined) return '不可用';
+      return (s / 60).toFixed(1) + ' min';
+    }
+
+    function fmtPercent(v) {
+      if (v === null || v === undefined) return '不可用';
+      return (v * 100).toFixed(1) + '%';
+    }
+
+    function clearCompareLayers() {
+      if (compareState.shortestLayer) { compareMap.removeLayer(compareState.shortestLayer); compareState.shortestLayer = null; }
+      if (compareState.fastestLayer) { compareMap.removeLayer(compareState.fastestLayer); compareState.fastestLayer = null; }
+      if (compareState.actualLayer) { compareMap.removeLayer(compareState.actualLayer); compareState.actualLayer = null; }
+      compareState.endpointMarkers.forEach(m => compareMap.removeLayer(m));
+      compareState.endpointMarkers = [];
+    }
+
+    async function loadBoundaryCompare() {
+      const resp = await fetch('/api/shenzhen-boundary');
+      const data = await resp.json();
+      if (data.error) return;
+      compareState.boundary = L.geoJSON(data, {
+        style: { color: '#123b7a', weight: 2, opacity: 0.9, fillOpacity: 0.02 }
+      }).addTo(compareMap);
+    }
+
+    async function loadOrders() {
+      compareStatus('正在查询订单...');
+      const params = new URLSearchParams();
+      const vehicleId = document.getElementById('vehicle-id').value.trim();
+      const dateFilter = document.getElementById('date-filter').value.trim();
+      const startFilter = document.getElementById('start-filter').value.trim();
+      const endFilter = document.getElementById('end-filter').value.trim();
+      const limitFilter = document.getElementById('limit-filter').value.trim();
+      if (vehicleId) params.set('vehicle_id', vehicleId);
+      if (dateFilter) params.set('date', dateFilter);
+      if (startFilter) params.set('start_time', startFilter);
+      if (endFilter) params.set('end_time', endFilter);
+      if (limitFilter) params.set('limit', limitFilter);
+
+      const resp = await fetch('/api/orders?' + params.toString());
+      const data = await resp.json();
+      if (!resp.ok || data.error) {
+        compareStatus(data.error || '订单查询失败', true);
+        return;
+      }
+
+      const list = document.getElementById('orders-list');
+      list.innerHTML = '';
+      compareState.orderItems = data.orders || [];
+      compareState.activeOrderIndex = null;
+
+      if (!compareState.orderItems.length) {
+        document.getElementById('orders-empty').style.display = 'block';
+        list.style.display = 'none';
+        compareStatus('没有匹配到订单。');
+        return;
+      }
+
+      document.getElementById('orders-empty').style.display = 'none';
+      list.style.display = 'block';
+
+      compareState.orderItems.forEach(item => {
+        const div = document.createElement('div');
+        div.className = 'result-item';
+        div.dataset.orderIndex = item.order_index;
+        div.innerHTML =
+          '<div class="result-title">订单 #' + item.order_index + ' / 车辆 ' + item.id + '</div>' +
+          '<div class="result-meta">上车: ' + item.pickup_time + '<br>下车: ' + item.dropoff_time + '<br>起终点节点: ' + item.pickup_node + ' -> ' + item.dropoff_node + '</div>';
+        div.addEventListener('click', () => loadOrderCompare(item.order_index));
+        list.appendChild(div);
+      });
+
+      compareStatus('已加载 ' + compareState.orderItems.length + ' 条候选订单。点击任意订单查看三路线对比。');
+    }
+
+    async function loadOrderCompare(orderIndex) {
+      clearCompareLayers();
+      compareState.requestSeq += 1;
+      const currentRequest = compareState.requestSeq;
+      compareStatus('正在计算订单三路线对比...');
+
+      document.querySelectorAll('.result-item').forEach(el => {
+        el.classList.toggle('active', String(orderIndex) === el.dataset.orderIndex);
+      });
+
+      const resp = await fetch('/api/orders/' + orderIndex + '/compare');
+      const data = await resp.json();
+
+      if (currentRequest !== compareState.requestSeq) {
+        return;
+      }
+
+      if (!resp.ok || data.error) {
+        compareStatus(data.error || '订单对比失败', true);
+        return;
+      }
+
+      const order = data.order;
+      const metrics = data.metrics;
+
+      if (data.shortest && data.shortest.available) {
+        compareState.shortestLayer = L.geoJSON(data.shortest.geojson, {
+          style: { color: 'blue', weight: 5, opacity: 0.75 }
+        }).addTo(compareMap);
+      }
+
+      if (data.fastest && data.fastest.available) {
+        compareState.fastestLayer = L.geoJSON(data.fastest.geojson, {
+          style: { color: 'green', weight: 5, opacity: 0.75 }
+        }).addTo(compareMap);
+      }
+
+      compareState.actualLayer = L.geoJSON(data.actual.geojson, {
+        style: { color: 'red', weight: 5, opacity: 0.85 }
+      }).addTo(compareMap);
+
+      const pickupMarker = L.marker([order.pickup_matched_lat, order.pickup_matched_lon]).addTo(compareMap).bindTooltip('上车点');
+      const dropoffMarker = L.marker([order.dropoff_matched_lat, order.dropoff_matched_lon]).addTo(compareMap).bindTooltip('下车点');
+      compareState.endpointMarkers = [pickupMarker, dropoffMarker];
+
+      const allLayers = [compareState.actualLayer, compareState.shortestLayer, compareState.fastestLayer].filter(Boolean);
+      if (allLayers.length) {
+        let bounds = allLayers[0].getBounds();
+        allLayers.slice(1).forEach(layer => { bounds = bounds.extend(layer.getBounds()); });
+        compareMap.fitBounds(bounds.pad(0.12));
+      }
+
+      document.getElementById('compare-empty').style.display = 'none';
+      document.getElementById('compare-summary').style.display = 'block';
+      document.getElementById('m-actual-distance').textContent = fmtDistance(metrics.actual_distance_m);
+      document.getElementById('m-actual-duration').textContent = fmtDuration(metrics.actual_duration_s);
+      document.getElementById('m-shortest-distance').textContent = fmtDistance(metrics.shortest_distance_m);
+      document.getElementById('m-fastest-distance').textContent = fmtDistance(metrics.fastest_distance_m);
+      document.getElementById('m-gap').textContent = fmtDistance(metrics.distance_gap_m);
+      document.getElementById('m-detour').textContent = fmtPercent(metrics.detour_ratio);
+      document.getElementById('m-shortest-overlap').textContent = fmtPercent(metrics.shortest_overlap);
+      document.getElementById('m-fastest-overlap').textContent = fmtPercent(metrics.fastest_overlap);
+
+      compareStatus('订单对比完成。');
+    }
+
+    loadBoundaryCompare();
+  </script>
+</body>
+</html>
+"""
+
+
 def _haversine_meters(lat1, lon1, lat2, lon2):
     from math import radians, sin, cos, sqrt, atan2
     r = 6371000.0
@@ -1020,6 +1342,375 @@ def _load_shenzhen_boundary():
     return _SHENZHEN_BOUNDARY
 
 
+def _load_stage7_od():
+    global _STAGE7_OD
+    if _STAGE7_OD is None:
+        if not os.path.exists(STAGE7_OD_PATH):
+            raise FileNotFoundError(
+                f'未找到阶段07校正OD缓存: {STAGE7_OD_PATH}，请先运行 python code/stage7_route.py'
+            )
+        od = pd.read_parquet(STAGE7_OD_PATH)
+        od['pickup_time'] = pd.to_datetime(od['pickup_time'])
+        od['dropoff_time'] = pd.to_datetime(od['dropoff_time'])
+        _STAGE7_OD = od
+    return _STAGE7_OD
+
+
+def _load_stage7_track(order_id=None, columns=None):
+    if not os.path.exists(STAGE7_TRACK_PATH):
+        raise FileNotFoundError(
+            f'未找到阶段07校正轨迹缓存: {STAGE7_TRACK_PATH}，请先生成 matched_trajectory_stage7.parquet'
+        )
+    cols = columns or ['id', 'time', 'status', 'matched_lon', 'matched_lat', 'edge_u', 'edge_v', 'edge_key']
+    track = pd.read_parquet(STAGE7_TRACK_PATH, columns=cols)
+    track['time'] = pd.to_datetime(track['time'])
+    if order_id is not None:
+        track = track[track['id'] == int(order_id)].copy()
+    return track
+
+
+def _load_road_correction_entry(vehicle_id):
+    cache_path = os.path.join(ROAD_CORRECTION_CACHE_DIR, f'{int(vehicle_id)}.pkl')
+    if not os.path.exists(cache_path):
+        return None
+    with open(cache_path, 'rb') as f:
+        data = pickle.load(f)
+    entries = data.get('entries') or {}
+    if not entries:
+        return None
+    return next(iter(entries.values()))
+
+
+def _route_gdf_from_nodes(g, route_nodes, weight_name):
+    rows = []
+    index = []
+    prev_geom = None
+
+    for u, v in zip(route_nodes[:-1], route_nodes[1:]):
+        edge_options = g.get_edge_data(u, v, default={})
+        if not edge_options:
+            continue
+
+        best_key = None
+        best_data = None
+        best_score = None
+        for key, data in edge_options.items():
+            weight = float(data.get(weight_name, data.get('length', 1.0)) or 1.0)
+            geom = _edge_linestring(g, u, v, key, data)
+            continuity_penalty = 0.0
+            if prev_geom is not None:
+                prev_end = Point(prev_geom.coords[-1])
+                curr_start = Point(geom.coords[0])
+                continuity_penalty = prev_end.distance(curr_start) * 100000.0
+            score = weight + continuity_penalty
+            if best_score is None or score < best_score:
+                best_key = key
+                best_data = data
+                best_score = score
+
+        if best_data is None:
+            continue
+        row = dict(best_data)
+        row['u'] = u
+        row['v'] = v
+        row['key'] = best_key
+        row['geometry'] = _edge_linestring(g, u, v, best_key, best_data)
+        rows.append(row)
+        index.append((u, v, best_key))
+        prev_geom = row['geometry']
+
+    if not rows:
+        return ox.routing.route_to_gdf(g, route_nodes, weight=weight_name)
+
+    import geopandas as gpd
+    gdf = gpd.GeoDataFrame(rows, geometry='geometry', crs=g.graph.get('crs'))
+    gdf.index = pd.MultiIndex.from_tuples(index, names=['u', 'v', 'key'])
+    return gdf
+
+
+def _edge_set_from_gdf(route_gdf):
+    return set(route_gdf.index.to_list())
+
+
+def _actual_edges_from_points(actual_points):
+    edge_columns = ['edge_u', 'edge_v', 'edge_key']
+    actual_edges = actual_points.dropna(subset=edge_columns)[edge_columns].copy()
+    if actual_edges.empty:
+        return actual_edges.reset_index(drop=True)
+    changed = actual_edges.ne(actual_edges.shift()).any(axis=1)
+    return actual_edges.loc[changed].reset_index(drop=True)
+
+
+def _actual_route_geometry(g, actual_edges):
+    actual_features = []
+    actual_distance = 0.0
+    for row in actual_edges.itertuples(index=False):
+        edge_data = g.get_edge_data(int(row.edge_u), int(row.edge_v), int(row.edge_key))
+        if edge_data is None:
+            continue
+        if isinstance(edge_data, dict) and 'length' not in edge_data and int(row.edge_key) in edge_data:
+            edge_data = edge_data[int(row.edge_key)]
+        length = float(edge_data.get('length', 0.0))
+        actual_distance += length
+        geom = edge_data.get('geometry')
+        if geom is None:
+            geom = LineString([
+                (float(g.nodes[int(row.edge_u)]['x']), float(g.nodes[int(row.edge_u)]['y'])),
+                (float(g.nodes[int(row.edge_v)]['x']), float(g.nodes[int(row.edge_v)]['y'])),
+            ])
+        actual_features.append(_feature_from_geom(geom, {
+            'kind': 'actual',
+            'edge_u': int(row.edge_u),
+            'edge_v': int(row.edge_v),
+            'edge_key': int(row.edge_key),
+            'length': length,
+        }))
+    return _feature_collection(actual_features), actual_distance
+
+
+def _actual_matched_points_geojson(actual_points):
+    points = actual_points[['matched_lat', 'matched_lon']].dropna().copy()
+    if len(points) < 2:
+        return _feature_collection([])
+
+    coords = [(float(row.matched_lon), float(row.matched_lat)) for row in points.itertuples(index=False)]
+    line = LineString(coords)
+    return _feature_collection([
+        _feature_from_geom(line, {
+            'kind': 'actual_matched_points',
+            'point_count': int(len(points)),
+        })
+    ])
+
+
+def _actual_corrected_geojson_from_cache(vehicle_id, pickup_time, dropoff_time):
+    entry = _load_road_correction_entry(vehicle_id)
+    if entry is None:
+        return None
+
+    timed_pieces = entry.get('timed_pieces') or []
+    if not timed_pieces:
+        return None
+
+    pickup_time = pd.to_datetime(pickup_time)
+    dropoff_time = pd.to_datetime(dropoff_time)
+    features = []
+    current_segment = []
+
+    def flush_segment():
+        nonlocal current_segment
+        if len(current_segment) >= 2:
+            line = LineString([(float(lon), float(lat)) for lat, lon in current_segment])
+            features.append(_feature_from_geom(line, {
+                'kind': 'actual_corrected_segment',
+                'point_count': int(len(current_segment)),
+            }))
+        current_segment = []
+
+    for piece in timed_pieces:
+        piece_start = pd.to_datetime(piece.get('start_time'))
+        piece_end = pd.to_datetime(piece.get('end_time'))
+        if piece_end < pickup_time or piece_start > dropoff_time:
+            continue
+        coords = piece.get('coords') or []
+        if piece.get('break_before'):
+            flush_segment()
+        for coord in coords:
+            if not current_segment or current_segment[-1] != coord:
+                current_segment.append(coord)
+
+    flush_segment()
+
+    if not features:
+        return None
+    return _feature_collection(features)
+
+
+def _matched_points_distance_m(actual_points):
+    points = actual_points[['matched_lat', 'matched_lon']].dropna().reset_index(drop=True)
+    if len(points) < 2:
+        return 0.0
+
+    total = 0.0
+    prev_lat = float(points.loc[0, 'matched_lat'])
+    prev_lon = float(points.loc[0, 'matched_lon'])
+    for i in range(1, len(points)):
+        curr_lat = float(points.loc[i, 'matched_lat'])
+        curr_lon = float(points.loc[i, 'matched_lon'])
+        total += _haversine_meters(prev_lat, prev_lon, curr_lat, curr_lon)
+        prev_lat = curr_lat
+        prev_lon = curr_lon
+    return float(total)
+
+
+def _geojson_length_overlap_ratio(actual_geojson, route_gdf, buffer_m=15.0):
+    if actual_geojson is None or route_gdf is None or route_gdf.empty:
+        return 0.0
+
+    actual_features = actual_geojson.get('features') or []
+    if not actual_features:
+        return 0.0
+
+    actual_gdf = gpd.GeoDataFrame.from_features(actual_features, crs='EPSG:4326')
+    if actual_gdf.empty:
+        return 0.0
+
+    route_metric = route_gdf.to_crs(epsg=3857)
+    actual_metric = actual_gdf.to_crs(epsg=3857)
+
+    route_union = unary_union(route_metric.geometry.tolist())
+    if route_union.is_empty:
+        return 0.0
+
+    actual_buffer = unary_union(actual_metric.geometry.buffer(buffer_m).tolist())
+    if actual_buffer.is_empty:
+        return 0.0
+
+    overlap = route_union.intersection(actual_buffer)
+    route_length = float(route_union.length)
+    if route_length <= 0:
+        return 0.0
+    return float(max(0.0, min(1.0, overlap.length / route_length)))
+
+
+def _order_candidates(limit=100, vehicle_id=None, date_str=None, start_time=None, end_time=None):
+    od = _load_stage7_od().copy()
+    od = od[
+        od['pickup_node'].notna()
+        & od['dropoff_node'].notna()
+        & (od['dropoff_time'] > od['pickup_time'])
+    ].copy()
+    if vehicle_id:
+        od = od[od['id'] == int(vehicle_id)]
+    if date_str:
+        od = od[od['pickup_time'].dt.strftime('%Y-%m-%d') == date_str]
+    if start_time:
+        od = od[od['pickup_time'] >= pd.to_datetime(start_time)]
+    if end_time:
+        od = od[od['pickup_time'] <= pd.to_datetime(end_time)]
+    od = od.sort_values(['pickup_time', 'id']).head(limit).copy()
+    od = od.reset_index().rename(columns={'index': 'order_index'})
+    return od
+
+
+def _compute_stage8_order_comparison(order_index):
+    od = _load_stage7_od().copy()
+    od = od.reset_index().rename(columns={'index': 'order_index'})
+    selected = od.loc[od['order_index'] == int(order_index)]
+    if selected.empty:
+        raise ValueError('未找到指定订单')
+    order = selected.iloc[0]
+
+    if pd.isna(order['pickup_node']) or pd.isna(order['dropoff_node']):
+        raise ValueError('该订单缺少校正起终点节点')
+    if order['dropoff_time'] <= order['pickup_time']:
+        raise ValueError('该订单上下车时间无效')
+
+    g = _load_stage7_graph()
+    track = _load_stage7_track(
+        order_id=int(order['id']),
+        columns=['id', 'time', 'status', 'matched_lon', 'matched_lat', 'edge_u', 'edge_v', 'edge_key']
+    )
+
+    actual_points = track[
+        track['time'].between(order['pickup_time'], order['dropoff_time'], inclusive='both')
+    ].sort_values('time').reset_index(drop=True)
+
+    if len(actual_points) < 2:
+        raise ValueError('该订单在校正轨迹缓存中没有足够的轨迹点')
+
+    actual_edges = _actual_edges_from_points(actual_points)
+    if actual_edges.empty:
+        raise ValueError('该订单缺少有效道路边序列，无法恢复实际路线')
+
+    actual_edge_geojson, actual_edge_distance = _actual_route_geometry(g, actual_edges)
+    actual_display_geojson = _actual_corrected_geojson_from_cache(
+        int(order['id']), order['pickup_time'], order['dropoff_time']
+    )
+    if actual_display_geojson is None:
+        actual_display_geojson = _actual_matched_points_geojson(actual_points)
+    actual_matched_distance = _matched_points_distance_m(actual_points)
+    actual_distance = max(float(actual_edge_distance), float(actual_matched_distance))
+    actual_duration = float((order['dropoff_time'] - order['pickup_time']).total_seconds())
+
+    origin_node = int(order['pickup_node'])
+    destination_node = int(order['dropoff_node'])
+
+    try:
+        shortest_route = nx.shortest_path(g, origin_node, destination_node, weight='length')
+        shortest_gdf = _route_gdf_from_nodes(g, shortest_route, 'length')
+    except (nx.NodeNotFound, nx.NetworkXNoPath):
+        shortest_gdf = None
+
+    try:
+        fastest_route = nx.shortest_path(g, origin_node, destination_node, weight='route_cost')
+        fastest_gdf = _route_gdf_from_nodes(g, fastest_route, 'route_cost')
+    except (nx.NodeNotFound, nx.NetworkXNoPath):
+        fastest_gdf = None
+
+    shortest_distance = float(shortest_gdf['length'].sum()) if shortest_gdf is not None else None
+    fastest_distance = float(fastest_gdf['length'].sum()) if fastest_gdf is not None else None
+    shortest_cost = float(shortest_gdf['route_cost'].sum()) if shortest_gdf is not None else None
+    fastest_cost = float(fastest_gdf['route_cost'].sum()) if fastest_gdf is not None else None
+
+    distance_gap = None if shortest_distance in (None, 0) else float(actual_distance - shortest_distance)
+    detour_ratio = None if shortest_distance in (None, 0) else float((actual_distance - shortest_distance) / shortest_distance)
+
+    shortest_overlap = _geojson_length_overlap_ratio(actual_display_geojson, shortest_gdf) if shortest_gdf is not None else 0.0
+    fastest_overlap = _geojson_length_overlap_ratio(actual_display_geojson, fastest_gdf) if fastest_gdf is not None else 0.0
+
+    return {
+        'order': {
+            'order_index': int(order['order_index']),
+            'id': int(order['id']),
+            'pickup_time': str(order['pickup_time']),
+            'dropoff_time': str(order['dropoff_time']),
+            'pickup_matched_lon': float(order['pickup_matched_lon']),
+            'pickup_matched_lat': float(order['pickup_matched_lat']),
+            'dropoff_matched_lon': float(order['dropoff_matched_lon']),
+            'dropoff_matched_lat': float(order['dropoff_matched_lat']),
+            'pickup_node': int(order['pickup_node']),
+            'dropoff_node': int(order['dropoff_node']),
+        },
+        'actual': {
+            'geojson': actual_display_geojson,
+            'edge_geojson': actual_edge_geojson,
+            'distance_m': float(actual_distance),
+            'edge_distance_m': float(actual_edge_distance),
+            'matched_distance_m': float(actual_matched_distance),
+            'duration_s': actual_duration,
+            'point_count': int(len(actual_points)),
+            'edge_count': int(len(actual_edges)),
+        },
+        'shortest': {
+            'geojson': json.loads(shortest_gdf.to_json()) if shortest_gdf is not None else None,
+            'distance_m': shortest_distance,
+            'cost_s': shortest_cost,
+            'edge_count': int(len(shortest_gdf)) if shortest_gdf is not None else None,
+            'available': shortest_gdf is not None,
+        },
+        'fastest': {
+            'geojson': json.loads(fastest_gdf.to_json()) if fastest_gdf is not None else None,
+            'distance_m': fastest_distance,
+            'cost_s': fastest_cost,
+            'edge_count': int(len(fastest_gdf)) if fastest_gdf is not None else None,
+            'available': fastest_gdf is not None,
+        },
+        'metrics': {
+            'actual_distance_m': float(actual_distance),
+            'actual_edge_distance_m': float(actual_edge_distance),
+            'actual_matched_distance_m': float(actual_matched_distance),
+            'shortest_distance_m': shortest_distance,
+            'fastest_distance_m': fastest_distance,
+            'actual_duration_s': actual_duration,
+            'distance_gap_m': distance_gap,
+            'detour_ratio': detour_ratio,
+            'shortest_overlap': shortest_overlap,
+            'fastest_overlap': fastest_overlap,
+        },
+    }
+
+
 def _edge_linestring(g, u, v, key, data):
     geom = data.get('geometry')
     if geom is not None:
@@ -1034,7 +1725,7 @@ def _safe_speed_kph(data):
     speed = data.get('baseline_speed_kph')
     if speed is None or speed <= 0:
         speed = 30.0
-    return float(speed)
+    return max(5.0, min(float(speed), 90.0))
 
 
 def _segment_cost_seconds(length_m, speed_kph):
@@ -1274,7 +1965,7 @@ def _compute_stage7_routes(origin_lon, origin_lat, destination_lon, destination_
                 except (nx.NodeNotFound, nx.NetworkXNoPath):
                     continue
 
-                middle_gdf = ox.routing.route_to_gdf(g, route_nodes, weight=weight_name)
+                middle_gdf = _route_gdf_from_nodes(g, route_nodes, weight_name)
                 middle_distance = float(middle_gdf['length'].sum()) if 'length' in middle_gdf else 0.0
                 middle_cost = float(middle_gdf['route_cost'].sum()) if 'route_cost' in middle_gdf else 0.0
 
@@ -1557,6 +2248,11 @@ def route_page():
     return render_template_string(ROUTE_TEMPLATE, active_page='routes')
 
 
+@app.route('/orders')
+def order_compare_page():
+    return render_template_string(ORDER_COMPARE_TEMPLATE, active_page='orders')
+
+
 @app.route('/maps/<path:filename>')
 def serve_map(filename):
     return send_from_directory(MAP_OUTPUT_DIR, filename)
@@ -1605,6 +2301,53 @@ def api_routes():
         })
     except KeyError:
         return jsonify({'error': '请求缺少 origin/destination 坐标字段'}), 400
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/api/orders')
+def api_orders():
+    try:
+        vehicle_id = request.args.get('vehicle_id', '').strip() or None
+        date_str = request.args.get('date', '').strip() or None
+        start_time = request.args.get('start_time', '').strip() or None
+        end_time = request.args.get('end_time', '').strip() or None
+        limit = int(request.args.get('limit', '20'))
+        limit = max(1, min(limit, 100))
+
+        result_df = _order_candidates(
+            limit=limit,
+            vehicle_id=vehicle_id,
+            date_str=date_str,
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+        records = []
+        for row in result_df.itertuples(index=False):
+            records.append({
+                'order_index': int(row.order_index),
+                'id': int(row.id),
+                'pickup_time': str(row.pickup_time),
+                'dropoff_time': str(row.dropoff_time),
+                'pickup_node': int(row.pickup_node),
+                'dropoff_node': int(row.dropoff_node),
+            })
+
+        return jsonify({'orders': records})
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/api/orders/<int:order_index>/compare')
+def api_order_compare(order_index):
+    try:
+        result = _compute_stage8_order_comparison(order_index)
+        return jsonify(result)
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 400
     except Exception as exc:
