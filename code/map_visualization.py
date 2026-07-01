@@ -1233,6 +1233,7 @@ def _inject_corrected_single_map_animation(m, vehicles_payload, initial_time_tex
     <div class="corrected-run-title">路网校正动态轨迹</div>
     <div class="corrected-run-controls">
       <button id="corrected-start-run" class="corrected-run-btn">开始运行</button>
+      <button id="corrected-reset-run" class="corrected-run-btn secondary">返回静态总览</button>
       <button id="corrected-speed-toggle" class="corrected-run-btn secondary">倍速 1x</button>
       <div style="font-size:12px; color:#475569;">先看静态轨迹，点击后再开始动画</div>
     </div>
@@ -1266,6 +1267,7 @@ def _inject_corrected_single_map_animation(m, vehicles_payload, initial_time_tex
         const timeEl = document.getElementById('corrected-live-time');
         const coordPanel = document.getElementById('coord-panel');
         const startButton = document.getElementById('corrected-start-run');
+        const resetButton = document.getElementById('corrected-reset-run');
         const speedButton = document.getElementById('corrected-speed-toggle');
         let playbackDelay = 180;
         let started = false;
@@ -1273,18 +1275,26 @@ def _inject_corrected_single_map_animation(m, vehicles_payload, initial_time_tex
 
         const staticCorrectedLayers = [];
 
-        vehicles.forEach(function(vehicle) {{
-          const correctedFrames = vehicle.corrected_frames || [];
-          if (!correctedFrames.length) return;
-          const staticLine = L.polyline(correctedFrames.map(function(frame) {{ return [frame.lat, frame.lon]; }}), {{
-            color: correctedColor,
-            weight: 4,
-            opacity: 0.55,
-            lineCap: 'round',
-            lineJoin: 'round'
-          }}).addTo(map);
-          staticCorrectedLayers.push(staticLine);
-        }});
+        function rebuildStaticLayers() {{
+          staticCorrectedLayers.forEach(function(layer) {{
+            if (map.hasLayer(layer)) map.removeLayer(layer);
+          }});
+          staticCorrectedLayers.length = 0;
+          vehicles.forEach(function(vehicle) {{
+            const correctedFrames = vehicle.corrected_frames || [];
+            if (!correctedFrames.length) return;
+            const staticLine = L.polyline(correctedFrames.map(function(frame) {{ return [frame.lat, frame.lon]; }}), {{
+              color: correctedColor,
+              weight: 4,
+              opacity: 0.55,
+              lineCap: 'round',
+              lineJoin: 'round'
+            }}).addTo(map);
+            staticCorrectedLayers.push(staticLine);
+          }});
+        }}
+
+        rebuildStaticLayers();
 
         vehicles.forEach(function(vehicle) {{
           const correctedFrames = vehicle.corrected_frames || [];
@@ -1352,6 +1362,40 @@ def _inject_corrected_single_map_animation(m, vehicles_payload, initial_time_tex
         }}
 
         if (timeEl) timeEl.textContent = initialTime;
+
+        function resetAnimation() {{
+          started = false;
+          vehicles.forEach(function(vehicle) {{
+            const correctedFrames = vehicle.corrected_frames || [];
+            if (vehicle.marker) {{ map.removeLayer(vehicle.marker); }}
+            if (vehicle.pathLine) {{ map.removeLayer(vehicle.pathLine); }}
+            if (!correctedFrames.length) return;
+            const start = correctedFrames[0];
+            vehicle.marker = L.circleMarker([start.lat, start.lon], {{
+              radius: 7,
+              color: '#ffffff',
+              weight: 2,
+              fillColor: correctedColor,
+              fillOpacity: 1
+            }}).addTo(map).bindPopup('车辆 ' + vehicle.vehicle_id + ' 校正轨迹');
+            vehicle.path = [[start.lat, start.lon]];
+            vehicle.pathLine = L.polyline(vehicle.path, {{
+              color: correctedColor,
+              weight: 5,
+              opacity: 0.92,
+              lineCap: 'round',
+              lineJoin: 'round'
+            }}).addTo(map);
+            vehicle.index = 0;
+          }});
+          rebuildStaticLayers();
+          if (timeEl) timeEl.textContent = initialTime;
+          if (startButton) {{
+            startButton.textContent = '开始运行';
+            startButton.disabled = false;
+          }}
+        }}
+
         if (speedButton) {{
           speedButton.addEventListener('click', function() {{
             if (playbackDelay === 180) {{ playbackDelay = 90; speedButton.textContent = '倍速 2x'; return; }}
@@ -1368,6 +1412,11 @@ def _inject_corrected_single_map_animation(m, vehicles_payload, initial_time_tex
             startButton.textContent = '运行中';
             startButton.disabled = true;
             setTimeout(tick, 220);
+          }});
+        }}
+        if (resetButton) {{
+          resetButton.addEventListener('click', function() {{
+            resetAnimation();
           }});
         }}
       }}
