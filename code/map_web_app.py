@@ -1094,7 +1094,10 @@ ORDER_COMPARE_TEMPLATE = """
           <label for="limit-filter">返回数量</label>
           <input id="limit-filter" value="20">
         </div>
-        <button type="button" onclick="loadOrders()">查询订单</button>
+        <div style="display:flex; gap:10px; margin-top:12px; flex-wrap:wrap;">
+          <button type="button" onclick="loadOrders()">查询订单</button>
+          <button type="button" onclick="runOrderSummary()">汇总分析</button>
+        </div>
       </div>
 
       <div id="orders-status" class="status">点击“查询订单”加载候选订单。</div>
@@ -1127,6 +1130,24 @@ ORDER_COMPARE_TEMPLATE = """
             <div class="metric"><div class="label">与最短路线重合率</div><div class="value" id="m-shortest-overlap">-</div></div>
             <div class="metric"><div class="label">与最快路线重合率</div><div class="value" id="m-fastest-overlap">-</div></div>
           </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>汇总分析</h2>
+        <div id="summary-empty" class="tips">点击“汇总分析”后，显示当前筛选条件下多订单的统计结果。</div>
+        <div id="summary-wrap" style="display:none;">
+          <div class="summary-grid" style="margin-bottom:12px;">
+            <div class="metric"><div class="label">订单数</div><div class="value" id="s-order-count">-</div></div>
+            <div class="metric"><div class="label">有效订单数</div><div class="value" id="s-valid-count">-</div></div>
+            <div class="metric"><div class="label">平均实际距离</div><div class="value" id="s-actual-mean">-</div></div>
+            <div class="metric"><div class="label">平均绕行比例</div><div class="value" id="s-detour-mean">-</div></div>
+            <div class="metric"><div class="label">平均最短重合率</div><div class="value" id="s-shortest-overlap-mean">-</div></div>
+            <div class="metric"><div class="label">平均最快重合率</div><div class="value" id="s-fastest-overlap-mean">-</div></div>
+          </div>
+          <div class="tips" id="summary-text"></div>
+          <div style="margin-top:12px; font-size:13px; font-weight:600;">高绕行订单</div>
+          <div id="summary-outliers" class="results" style="max-height:220px; margin-top:8px;"></div>
         </div>
       </div>
     </aside>
@@ -1180,17 +1201,7 @@ ORDER_COMPARE_TEMPLATE = """
       compareState.endpointMarkers = [];
     }
 
-    async function loadBoundaryCompare() {
-      const resp = await fetch('/api/shenzhen-boundary');
-      const data = await resp.json();
-      if (data.error) return;
-      compareState.boundary = L.geoJSON(data, {
-        style: { color: '#123b7a', weight: 2, opacity: 0.9, fillOpacity: 0.02 }
-      }).addTo(compareMap);
-    }
-
-    async function loadOrders() {
-      compareStatus('正在查询订单...');
+    function currentOrderParams() {
       const params = new URLSearchParams();
       const vehicleId = document.getElementById('vehicle-id').value.trim();
       const dateFilter = document.getElementById('date-filter').value.trim();
@@ -1202,6 +1213,21 @@ ORDER_COMPARE_TEMPLATE = """
       if (startFilter) params.set('start_time', startFilter);
       if (endFilter) params.set('end_time', endFilter);
       if (limitFilter) params.set('limit', limitFilter);
+      return params;
+    }
+
+    async function loadBoundaryCompare() {
+      const resp = await fetch('/api/shenzhen-boundary');
+      const data = await resp.json();
+      if (data.error) return;
+      compareState.boundary = L.geoJSON(data, {
+        style: { color: '#123b7a', weight: 2, opacity: 0.9, fillOpacity: 0.02 }
+      }).addTo(compareMap);
+    }
+
+    async function loadOrders() {
+      compareStatus('正在查询订单...');
+      const params = currentOrderParams();
 
       const resp = await fetch('/api/orders?' + params.toString());
       const data = await resp.json();
@@ -1237,6 +1263,47 @@ ORDER_COMPARE_TEMPLATE = """
       });
 
       compareStatus('已加载 ' + compareState.orderItems.length + ' 条候选订单。点击任意订单查看三路线对比。');
+    }
+
+    async function runOrderSummary() {
+      compareStatus('正在执行多订单汇总分析...');
+      const params = currentOrderParams();
+      const resp = await fetch('/api/orders/summary?' + params.toString());
+      const data = await resp.json();
+
+      if (!resp.ok || data.error) {
+        compareStatus(data.error || '汇总分析失败', true);
+        return;
+      }
+
+      document.getElementById('summary-empty').style.display = 'none';
+      document.getElementById('summary-wrap').style.display = 'block';
+      document.getElementById('s-order-count').textContent = data.summary.total_orders;
+      document.getElementById('s-valid-count').textContent = data.summary.valid_orders;
+      document.getElementById('s-actual-mean').textContent = fmtDistance(data.summary.actual_distance_mean_m);
+      document.getElementById('s-detour-mean').textContent = fmtPercent(data.summary.detour_ratio_mean);
+      document.getElementById('s-shortest-overlap-mean').textContent = fmtPercent(data.summary.shortest_overlap_mean);
+      document.getElementById('s-fastest-overlap-mean').textContent = fmtPercent(data.summary.fastest_overlap_mean);
+
+      document.getElementById('summary-text').textContent =
+        '最短距离参考中位数: ' + fmtDistance(data.summary.shortest_distance_median_m) +
+        '；最快路线距离中位数: ' + fmtDistance(data.summary.fastest_distance_median_m) +
+        '；实际耗时中位数: ' + fmtDuration(data.summary.actual_duration_median_s) + '。';
+
+      const outliersWrap = document.getElementById('summary-outliers');
+      outliersWrap.innerHTML = '';
+      (data.outliers || []).forEach(item => {
+        const div = document.createElement('div');
+        div.className = 'result-item';
+        div.innerHTML =
+          '<div class="result-title">订单 #' + item.order_index + ' / 车辆 ' + item.id + '</div>' +
+          '<div class="result-meta">上车: ' + item.pickup_time + '<br>绕行比例: ' + fmtPercent(item.detour_ratio) +
+          '<br>最短重合率: ' + fmtPercent(item.shortest_overlap) + ' / 最快重合率: ' + fmtPercent(item.fastest_overlap) + '</div>';
+        div.addEventListener('click', () => loadOrderCompare(item.order_index));
+        outliersWrap.appendChild(div);
+      });
+
+      compareStatus('汇总分析完成。');
     }
 
     async function loadOrderCompare(orderIndex) {
@@ -1708,6 +1775,75 @@ def _compute_stage8_order_comparison(order_index):
             'shortest_overlap': shortest_overlap,
             'fastest_overlap': fastest_overlap,
         },
+    }
+
+
+def _safe_mean(values):
+    vals = [float(v) for v in values if v is not None and pd.notna(v)]
+    if not vals:
+        return None
+    return float(pd.Series(vals).mean())
+
+
+def _safe_median(values):
+    vals = [float(v) for v in values if v is not None and pd.notna(v)]
+    if not vals:
+        return None
+    return float(pd.Series(vals).median())
+
+
+def _compute_stage8_order_summary(limit=20, vehicle_id=None, date_str=None, start_time=None, end_time=None):
+    candidates = _order_candidates(
+        limit=limit,
+        vehicle_id=vehicle_id,
+        date_str=date_str,
+        start_time=start_time,
+        end_time=end_time,
+    )
+
+    results = []
+    failed = []
+    for row in candidates.itertuples(index=False):
+        try:
+            results.append(_compute_stage8_order_comparison(int(row.order_index)))
+        except Exception as exc:
+            failed.append({
+                'order_index': int(row.order_index),
+                'id': int(row.id),
+                'error': str(exc),
+            })
+
+    metrics_list = [item['metrics'] for item in results]
+    summary = {
+        'total_orders': int(len(candidates)),
+        'valid_orders': int(len(results)),
+        'failed_orders': int(len(failed)),
+        'actual_distance_mean_m': _safe_mean([m['actual_distance_m'] for m in metrics_list]),
+        'shortest_distance_median_m': _safe_median([m['shortest_distance_m'] for m in metrics_list]),
+        'fastest_distance_median_m': _safe_median([m['fastest_distance_m'] for m in metrics_list]),
+        'actual_duration_median_s': _safe_median([m['actual_duration_s'] for m in metrics_list]),
+        'detour_ratio_mean': _safe_mean([m['detour_ratio'] for m in metrics_list]),
+        'shortest_overlap_mean': _safe_mean([m['shortest_overlap'] for m in metrics_list]),
+        'fastest_overlap_mean': _safe_mean([m['fastest_overlap'] for m in metrics_list]),
+    }
+
+    outliers = []
+    for item in results:
+        m = item['metrics']
+        outliers.append({
+            'order_index': item['order']['order_index'],
+            'id': item['order']['id'],
+            'pickup_time': item['order']['pickup_time'],
+            'detour_ratio': m['detour_ratio'],
+            'shortest_overlap': m['shortest_overlap'],
+            'fastest_overlap': m['fastest_overlap'],
+        })
+    outliers.sort(key=lambda x: (x['detour_ratio'] if x['detour_ratio'] is not None else -999), reverse=True)
+
+    return {
+        'summary': summary,
+        'outliers': outliers[:10],
+        'failed': failed[:20],
     }
 
 
@@ -2347,6 +2483,30 @@ def api_orders():
 def api_order_compare(order_index):
     try:
         result = _compute_stage8_order_comparison(order_index)
+        return jsonify(result)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/api/orders/summary')
+def api_order_summary():
+    try:
+        vehicle_id = request.args.get('vehicle_id', '').strip() or None
+        date_str = request.args.get('date', '').strip() or None
+        start_time = request.args.get('start_time', '').strip() or None
+        end_time = request.args.get('end_time', '').strip() or None
+        limit = int(request.args.get('limit', '20'))
+        limit = max(1, min(limit, 200))
+
+        result = _compute_stage8_order_summary(
+            limit=limit,
+            vehicle_id=vehicle_id,
+            date_str=date_str,
+            start_time=start_time,
+            end_time=end_time,
+        )
         return jsonify(result)
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 400
